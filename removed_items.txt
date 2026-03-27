@@ -1,0 +1,41 @@
+Removed or collapsed in the run-only refactor
+
+1. Data source modes not used for the final run
+- data_root + shard_glob fallback
+- window_manifest / window_id / resident_shards staging path
+- resampled (infinite) mode
+
+2. Model branches not used in the chosen recipe
+- CoordFourierEmbedding branch
+- FFT frequency features + FiLM fusion
+- frequency-domain masking / corruption path
+- predictor MLP alternative
+- GEGLU / GELU MLP alternatives
+- RMSNorm branch
+- QK normalization options
+- LayerScale branch
+
+3. Training-only ablation modules removed
+- VICReg regularizer
+- layer-wise spectral alignment heads
+- init_from weights-only bootstrapping path
+- proxy logging / bucket-profiling extras
+- synthetic auto_tune_tokens_per_batch path inside train.py
+
+4. Data-path simplifications
+- deterministic split-and-fit only (no long_crop random policy)
+- ShapeBatcher default changed to drop incomplete / expired buckets instead of yielding tiny tail batches
+- fixed worker-side style-3 mask path only
+
+5. DDP-safety change
+- local token-budget accumulation semantics were replaced with global effective target-token accumulation
+  (all ranks agree on step boundaries)
+
+6. Things intentionally kept
+- shards_txt finite-pass training
+- optional shard cache
+- hybrid encoder with divided blocks + every-4th full block
+- spatial bias + legendre-anchor spatial Q/K features
+- relational spectral auxiliary loss
+- torch.compile option
+- simple custom checkpoint / resume path
