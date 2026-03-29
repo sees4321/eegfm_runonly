@@ -4,10 +4,12 @@ from __future__ import annotations
 import glob
 import hashlib
 import io
+import json
 import math
 import os
 import random
 import shutil
+import sys
 from contextlib import contextmanager
 from typing import Any, Dict, Iterable, Iterator, List, Optional, Tuple
 
@@ -25,6 +27,18 @@ except Exception:
 
 EEG_KEY = "eeg.npy"
 COORD_KEY = "coords.npy"
+EEG_KEY_ALIASES = (
+    "eeg.npy", "eeg.npz", "eeg", "eeg.pyd",
+    "x.npy", "x.npz", "x", "signal.npy", "signal",
+)
+COORD_KEY_ALIASES = (
+    "coords.npy", "coord.npy", "coords.npz", "coord.npz",
+    "coords", "coord", "coords.pyd", "coord.pyd",
+    "xyz.npy", "xyz",
+)
+_BAD_SAMPLE_LOG = os.environ.get("EEGFM_BAD_SAMPLE_LOG", "")
+_WARN_MAX = int(os.environ.get("EEGFM_BAD_SAMPLE_WARN_MAX", "32"))
+_WARN_COUNT = 0
 
 
 def read_shards_txt(path: str) -> List[str]:
@@ -164,10 +178,117 @@ def _as_torch(x: Any) -> torch.Tensor:
     raise TypeError(type(x))
 
 
-def decode_sample(sample: Dict[str, Any]) -> Dict[str, Any]:
-    eeg = _as_torch(sample[EEG_KEY]).to(torch.float16)
-    coord = _as_torch(sample[COORD_KEY]).to(torch.float32) * 10.0
-    return {"eeg": eeg, "coord": coord}
+def _key_matches_alias(key: str, alias: str) -> bool:
+    base = os.path.basename(str(key)).lower()
+    alias_l = alias.lower()
+    if base == alias_l:
+        return True
+    for sep in (".", "_", "-"):
+        if base.endswith(sep + alias_l):
+            return True
+    return base.endswith(alias_l)
+
+
+def _remove_alias_suffix(key: str, alias: str) -> str:
+    base = os.path.basename(str(key))
+    base_l = base.lower()
+    alias_l = alias.lower()
+    if base_l == alias_l:
+        return ""
+    for sep in (".", "_", "-"):
+        token = sep + alias_l
+        if base_l.endswith(token):
+            return base[: -len(token)]
+    if base_l.endswith(alias_l):
+        return base[: -len(alias_l)].rstrip("._-")
+    return base
+
+
+def _resolve_candidates(sample: Dict[str, Any], aliases: Tuple[str, ...]) -> List[Dict[str, Any]]:
+    out: List[Dict[str, Any]] = []
+    for k, v in sample.items():
+        ks = str(k)
+        if ks.startswith("__"):
+            continue
+        for alias in aliases:
+            if _key_matches_alias(ks, alias):
+                base = os.path.basename(ks)
+                out.append({
+                    "key": ks,
+                    "value": v,
+                    "alias": alias,
+                    "exact": base.lower() == alias.lower(),
+                    "stem": _remove_alias_suffix(base, alias),
+                })
+                break
+    out.sort(key=lambda d: (0 if d["exact"] else 1, len(d["key"]), d["key"]))
+    return out
+
+
+def _resolve_pair(sample: Dict[str, Any]) -> Tuple[Optional[Any], Optional[str], Optional[Any], Optional[str]]:
+    eegs = _resolve_candidates(sample, EEG_KEY_ALIASES)
+    coords = _resolve_candidates(sample, COORD_KEY_ALIASES)
+    if not eegs or not coords:
+        return None, None, None, None
+
+    for e in eegs:
+        for c in coords:
+            if e["stem"] and c["stem"] and e["stem"] == c["stem"]:
+                return e["value"], e["key"], c["value"], c["key"]
+
+    return eegs[0]["value"], eegs[0]["key"], coords[0]["value"], coords[0]["key"]
+
+
+def _report_bad_sample(sample: Dict[str, Any], reason: str) -> None:
+    global _WARN_COUNT
+    payload = {
+        "reason": str(reason),
+        "__key__": sample.get("__key__"),
+        "__url__": sample.get("__url__"),
+        "keys": sorted([str(k) for k in sample.keys()]),
+    }
+    msg = "[bad-sample] " + json.dumps(payload, ensure_ascii=False)
+    if _WARN_COUNT < _WARN_MAX:
+        print(msg, file=sys.stderr, flush=True)
+        _WARN_COUNT += 1
+    if _BAD_SAMPLE_LOG:
+        try:
+            os.makedirs(os.path.dirname(_BAD_SAMPLE_LOG) or ".", exist_ok=True)
+            with open(_BAD_SAMPLE_LOG, "a", encoding="utf-8") as f:
+                f.write(json.dumps(payload, ensure_ascii=False) + "\n")
+        except Exception:
+            pass
+
+
+def decode_sample(sample: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    eeg_raw, eeg_key, coord_raw, coord_key = _resolve_pair(sample)
+    if eeg_raw is None or coord_raw is None:
+        eeg_cands = [d["key"] for d in _resolve_candidates(sample, EEG_KEY_ALIASES)]
+        coord_cands = [d["key"] for d in _resolve_candidates(sample, COORD_KEY_ALIASES)]
+        _report_bad_sample(sample, f"missing required field(s): eeg_candidates={eeg_cands}, coord_candidates={coord_cands}")
+        return None
+
+    try:
+        eeg = _as_torch(eeg_raw).to(torch.float16)
+        coord = _as_torch(coord_raw).to(torch.float32) * 10.0
+    except Exception as e:
+        _report_bad_sample(sample, f"tensor decode failed: {type(e).__name__}: {e}")
+        return None
+
+    if eeg.ndim != 2:
+        _report_bad_sample(sample, f"unexpected eeg ndim={eeg.ndim}, expected 2 (picked {eeg_key!r})")
+        return None
+    if coord.ndim != 2:
+        _report_bad_sample(sample, f"unexpected coord ndim={coord.ndim}, expected 2 (picked {coord_key!r})")
+        return None
+    if eeg.shape[0] != coord.shape[0]:
+        _report_bad_sample(sample, f"channel mismatch: eeg C={eeg.shape[0]} ({eeg_key!r}) vs coord C={coord.shape[0]} ({coord_key!r})")
+        return None
+    if eeg.shape[1] <= 0:
+        _report_bad_sample(sample, f"empty time dimension T={eeg.shape[1]} (picked {eeg_key!r})")
+        return None
+
+    return {"eeg": eeg.contiguous(), "coord": coord.contiguous()}
 
 
 def _flatmap_stage(mapper):

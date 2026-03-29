@@ -685,7 +685,7 @@ def run_train(args: argparse.Namespace) -> Dict[str, str]:
                     logs["train/spec_rel_loss"] = _distributed_mean(float(spec_rel_loss.detach().item()), dev)
                     logs["train/spec_rel_weight"] = float(spec_lam)
 
-                if accelerator.is_main_process:
+                if accelerator.is_main_process and not train_cfg.use_wandb:
                     print(
                         f"[step {global_step:07d}] l1={logs['train/l1_mean']:.6f} "
                         f"lr={logs['train/lr']:.3e} ema={logs['train/ema_momentum']:.6f} "

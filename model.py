@@ -446,6 +446,16 @@ class DividedSpatiotemporalBlock(nn.Module):
         )
 
         self.norm_s = nn.LayerNorm(D, eps=1e-6)
+        # In the fixed training recipe we use channel-wise spatial bias for divided
+        # spatial attention whenever spatial_bias_type is enabled. In that case the
+        # additive spatial Q/K path below would be unreachable (the forward path
+        # prefers bias over q/k augmentation), which creates permanently-unused
+        # parameters under DDP. We therefore only instantiate the divided-block
+        # spatial Q/K projections when no spatial bias is active.
+        use_divided_spatial_qk = (
+            (str(cfg.spatial_qk_type).lower() == "legendre_anchor")
+            and (str(cfg.spatial_bias_type).lower() in ("none", "off", "disable", "disabled"))
+        )
         self.attn_s = MultiheadSelfAttentionRoPE(
             d_model=D,
             n_heads=cfg.n_heads,
@@ -454,7 +464,7 @@ class DividedSpatiotemporalBlock(nn.Module):
             rotary_pct=0.0,
             spatial_qk_dim=cfg.spatial_qk_feat_dim,
             spatial_qk_scale=cfg.spatial_qk_scale,
-            use_spatial_qk=(str(cfg.spatial_qk_type).lower() == "legendre_anchor"),
+            use_spatial_qk=use_divided_spatial_qk,
             max_seq_len=cfg.max_tokens,
         )
 
