@@ -103,6 +103,13 @@ def _distributed_mean(value: float, device: torch.device) -> float:
     return float(t.item())
 
 
+def _distributed_sum_float(value: float, device: torch.device) -> float:
+    t = torch.tensor([float(value)], device=device, dtype=torch.float32)
+    if dist.is_available() and dist.is_initialized():
+        dist.all_reduce(t, op=dist.ReduceOp.SUM)
+    return float(t.item())
+
+
 def _append_jsonl(path: Optional[str], payload: Dict[str, object]) -> None:
     if not path:
         return
@@ -459,7 +466,7 @@ def run_train(args: argparse.Namespace) -> Dict[str, str]:
     pass_context_tokens_global = 0
 
     it = iter(loader)
-    pbar = tqdm(total=int(train_cfg.max_steps), disable=not accelerator.is_local_main_process, dynamic_ncols=True)
+    pbar = tqdm(total=int(train_cfg.max_steps), disable=not accelerator.is_local_main_process)
     if global_step > 0:
         pbar.update(global_step)
 
@@ -520,6 +527,20 @@ def run_train(args: argparse.Namespace) -> Dict[str, str]:
         B = x.shape[0]
         P_max = int(batch["P_max_cpu"])
         x = rescale_small_segments(x, target_amp=1.0, quantile=0.90, amp_floor=1e-4, gain_max=200.0, clip=15.0)
+
+        input_bad_local = int((not bool(torch.isfinite(x).all().item())) or (not bool(torch.isfinite(coords).all().item())))
+        input_bad_any = _distributed_sum(input_bad_local, dev) > 0
+        if input_bad_any:
+            if input_bad_local:
+                _append_jsonl(os.environ.get("EEGFM_MAINL1_DEBUG_LOG"), {
+                    "step": int(global_step),
+                    "reason": "nonfinite_input_batch",
+                    "x_finite": bool(torch.isfinite(x).all().item()),
+                    "coords_finite": bool(torch.isfinite(coords).all().item()),
+                    "x_absmax": float(torch.nan_to_num(x.float(), nan=0.0, posinf=0.0, neginf=0.0).abs().max().item()) if x.numel() > 0 else 0.0,
+                    "coords_absmax": float(torch.nan_to_num(coords.float(), nan=0.0, posinf=0.0, neginf=0.0).abs().max().item()) if coords.numel() > 0 else 0.0,
+                })
+            continue
 
         local_input_tokens = int(batch["valid_tokens"])
         local_target_tokens = int(batch["target_tokens"])
@@ -582,22 +603,28 @@ def run_train(args: argparse.Namespace) -> Dict[str, str]:
                 z_ctx = student(tok_ctx, padding_mask=pad_ctx2, rope_pos=rope_ctx, chan_idx=chan_ctx, coords=coords, grid_patches=P_max)
 
                 with torch.no_grad():
-                    coord_ch_teacher = teacher.coord_embed(coords)
-                    patches_view_t = teacher.extract_patches_view(x)
-                    c_safe_t = c_tgt.clamp(min=0)
-                    t_safe_t = t_tgt.clamp(min=0)
-                    b_idx_t = torch.arange(B, device=x.device)[:, None].expand(B, c_safe_t.shape[1])
-                    cached_tgt_patches = patches_view_t[b_idx_t, c_safe_t, t_safe_t]
+                    # Teacher target path is forced to fp32 because main-loss NaNs were observed
+                    # while spec_rel stayed finite, which points more strongly to z_tgt instability than
+                    # to the student/predictor/spec-rel path.
+                    with torch.autocast(device_type=dev.type, enabled=False):
+                        x_teacher = x.float()
+                        coords_teacher = coords.float()
+                        coord_ch_teacher = teacher.coord_embed(coords_teacher)
+                        patches_view_t = teacher.extract_patches_view(x_teacher)
+                        c_safe_t = c_tgt.clamp(min=0)
+                        t_safe_t = t_tgt.clamp(min=0)
+                        b_idx_t = torch.arange(B, device=x.device)[:, None].expand(B, c_safe_t.shape[1])
+                        cached_tgt_patches = patches_view_t[b_idx_t, c_safe_t, t_safe_t]
 
-                    tok_tgt, pad_tgt2, rope_tgt, chan_tgt = teacher.embed_from_indices(
-                        x=x,
-                        coords=coords,
-                        c_idx=c_tgt,
-                        t_idx=t_tgt,
-                        pad=pad_tgt,
-                        coord_ch=coord_ch_teacher,
-                    )
-                    z_tgt = teacher(tok_tgt, padding_mask=pad_tgt2, rope_pos=rope_tgt, chan_idx=chan_tgt, coords=coords)
+                        tok_tgt, pad_tgt2, rope_tgt, chan_tgt = teacher.embed_from_indices(
+                            x=x_teacher,
+                            coords=coords_teacher,
+                            c_idx=c_tgt,
+                            t_idx=t_tgt,
+                            pad=pad_tgt,
+                            coord_ch=coord_ch_teacher,
+                        )
+                        z_tgt = teacher(tok_tgt, padding_mask=pad_tgt2, rope_pos=rope_tgt, chan_idx=chan_tgt, coords=coords_teacher)
 
                 coord_tgt = gather_channel_embeddings(coord_ch_student, c_tgt.clamp(min=0), pad_tgt)
                 pred_tgt = predictor(
@@ -610,33 +637,49 @@ def run_train(args: argparse.Namespace) -> Dict[str, str]:
                 )
 
                 valid_tgt = ~pad_tgt
-                pred_row_finite = torch.isfinite(pred_tgt).all(dim=-1)
-                tgt_row_finite = torch.isfinite(z_tgt).all(dim=-1)
-                main_row_good = valid_tgt & pred_row_finite & tgt_row_finite
-                n_valid_rows_local = int(valid_tgt.sum().item())
-                n_good_rows_local = int(main_row_good.sum().item())
-                bad_rows_local = int(n_valid_rows_local - n_good_rows_local)
-                if bad_rows_local > 0:
-                    _append_jsonl(os.environ.get("EEGFM_DEBUG_LOG"), {
-                        "event": "drop_nonfinite_main_rows",
-                        "step": int(global_step),
-                        "rank": int(accelerator.process_index),
-                        "n_valid_rows": n_valid_rows_local,
-                        "n_good_rows": n_good_rows_local,
-                        "bad_rows": bad_rows_local,
-                        "bad_rows_per_sample": (~(pred_row_finite & tgt_row_finite) & valid_tgt).sum(dim=1).detach().cpu().tolist(),
-                        "valid_rows_per_sample": valid_tgt.sum(dim=1).detach().cpu().tolist(),
-                        "coords_bad_channels_per_sample": (~torch.isfinite(coords).all(dim=-1)).sum(dim=1).detach().cpu().tolist(),
-                        "coord_absmax_per_sample": torch.nan_to_num(coords.abs(), nan=0.0, posinf=0.0, neginf=0.0).amax(dim=(1,2)).detach().cpu().tolist(),
-                    })
+                # num_tgt_local = valid_tgt.sum().float().clamp_min(1.0)
 
-                num_tgt_local = main_row_good.sum().float().clamp_min(1.0)
-                if n_good_rows_local > 0:
-                    pred_main = pred_tgt[main_row_good].float()
-                    tgt_main = z_tgt[main_row_good].float()
-                    l1_sum_local = torch.abs(pred_main - tgt_main).sum()
+                pred_valid = pred_tgt[valid_tgt]
+                tgt_valid = z_tgt[valid_tgt]
+                n_valid_rows_local = int(pred_valid.shape[0])
+                if n_valid_rows_local > 0:
+                    pred_finite_rows = torch.isfinite(pred_valid).all(dim=-1)
+                    tgt_finite_rows = torch.isfinite(tgt_valid).all(dim=-1)
+                    finite_rows = pred_finite_rows & tgt_finite_rows
+                    n_finite_rows_local = int(finite_rows.sum().item())
+                    if n_finite_rows_local < n_valid_rows_local:
+                        _append_jsonl(os.environ.get("EEGFM_MAINL1_DEBUG_LOG"), {
+                            "step": int(global_step),
+                            "reason": "nonfinite_main_rows",
+                            "n_valid_rows": n_valid_rows_local,
+                            "n_finite_rows": n_finite_rows_local,
+                            "pred_finite_rows": int(pred_finite_rows.sum().item()),
+                            "tgt_finite_rows": int(tgt_finite_rows.sum().item()),
+                            "pred_has_nan": bool(torch.isnan(pred_valid).any().item()),
+                            "pred_has_inf": bool(torch.isinf(pred_valid).any().item()),
+                            "tgt_has_nan": bool(torch.isnan(tgt_valid).any().item()),
+                            "tgt_has_inf": bool(torch.isinf(tgt_valid).any().item()),
+                            "pred_absmax": float(torch.nan_to_num(pred_valid.float(), nan=0.0, posinf=0.0, neginf=0.0).abs().max().item()),
+                            "tgt_absmax": float(torch.nan_to_num(tgt_valid.float(), nan=0.0, posinf=0.0, neginf=0.0).abs().max().item()),
+                        })
+                    if n_finite_rows_local > 0:
+                        diff_valid = torch.abs(pred_valid[finite_rows].float() - tgt_valid[finite_rows].float())
+                        l1_sum_local = diff_valid.sum()
+                    else:
+                        # Preserve graph with a typed zero while dropping this microbatch contribution.
+                        l1_sum_local = pred_tgt.float().sum() * 0.0
+                        _append_jsonl(os.environ.get("EEGFM_MAINL1_DEBUG_LOG"), {
+                            "step": int(global_step),
+                            "reason": "no_finite_rows_for_main_l1",
+                            "n_valid_rows": n_valid_rows_local,
+                        })
                 else:
-                    l1_sum_local = pred_tgt.new_tensor(0.0, dtype=torch.float32)
+                    n_finite_rows_local = 0
+                    l1_sum_local = pred_tgt.float().sum() * 0.0
+                    _append_jsonl(os.environ.get("EEGFM_MAINL1_DEBUG_LOG"), {
+                        "step": int(global_step),
+                        "reason": "zero_valid_target_rows",
+                    })
                 loss_sum_local = l1_sum_local
 
                 spec_rel_loss = None
@@ -654,9 +697,8 @@ def run_train(args: argparse.Namespace) -> Dict[str, str]:
 
                     # Compute relational auxiliary loss outside autocast in fp32.
                     with torch.autocast(device_type=dev.type, enabled=False):
-                        valid_rel = valid_tgt & torch.isfinite(pred_tgt).all(dim=-1)
-                        patches_flat = cached_tgt_patches[valid_rel].float()
-                        z_flat = pred_tgt[valid_rel].float()
+                        patches_flat = cached_tgt_patches[valid_tgt].float()
+                        z_flat = pred_tgt[valid_tgt].float()
                         n_rel = int(z_flat.shape[0])
 
                         if n_rel >= 2 and torch.isfinite(patches_flat).all() and torch.isfinite(z_flat).all():
@@ -680,7 +722,7 @@ def run_train(args: argparse.Namespace) -> Dict[str, str]:
                                     tau_s=float(train_cfg.spec_rel_tau_s),
                                 )
                             else:
-                                _append_jsonl(os.environ.get("EEGFM_DEBUG_LOG"), {
+                                _append_jsonl(os.environ.get("EEGFM_SPECREL_DEBUG_LOG"), {
                                     "step": int(global_step),
                                     "reason": "nonfinite_after_projection",
                                     "n_rel": n_rel,
@@ -691,7 +733,7 @@ def run_train(args: argparse.Namespace) -> Dict[str, str]:
                                 })
                                 spec_rel_loss = None
                         else:
-                            _append_jsonl(os.environ.get("EEGFM_DEBUG_LOG"), {
+                            _append_jsonl(os.environ.get("EEGFM_SPECREL_DEBUG_LOG"), {
                                 "step": int(global_step),
                                 "reason": "degenerate_or_nonfinite_input",
                                 "n_rel": n_rel,
@@ -704,20 +746,25 @@ def run_train(args: argparse.Namespace) -> Dict[str, str]:
                         if torch.isfinite(spec_rel_loss):
                             loss_sum_local = loss_sum_local + spec_lam * spec_rel_loss
                         else:
-                            _append_jsonl(os.environ.get("EEGFM_DEBUG_LOG"), {
+                            _append_jsonl(os.environ.get("EEGFM_SPECREL_DEBUG_LOG"), {
                                 "step": int(global_step),
                                 "reason": "nonfinite_spec_rel_loss",
                             })
                             spec_rel_loss = None
 
                 loss_scaled = (loss_sum_local * float(weight) * float(world_size)) / (float(max(1, budget_tokens)) * float(model_cfg.d_model))
-                if not torch.isfinite(loss_scaled):
-                    _append_jsonl(os.environ.get("EEGFM_DEBUG_LOG"), {
-                        "event": "skip_nonfinite_loss_scaled",
+
+            loss_bad_local = int(not bool(torch.isfinite(loss_scaled).item()))
+            loss_bad_any = _distributed_sum(loss_bad_local, dev) > 0
+            if loss_bad_any:
+                if loss_bad_local:
+                    _append_jsonl(os.environ.get("EEGFM_MAINL1_DEBUG_LOG"), {
                         "step": int(global_step),
-                        "rank": int(accelerator.process_index),
+                        "reason": "nonfinite_loss_scaled",
+                        "loss_scaled": str(loss_scaled.detach().float().cpu().item()) if loss_scaled.numel() == 1 else "tensor",
                     })
-                    loss_scaled = loss_scaled.new_tensor(0.0)
+                optimizer.zero_grad(set_to_none=True)
+                continue
 
             accelerator.backward(loss_scaled)
 
@@ -737,8 +784,22 @@ def run_train(args: argparse.Namespace) -> Dict[str, str]:
             for pg in optimizer.param_groups:
                 pg["lr"] = lr_now
 
+            grad_norm = None
             if float(train_cfg.grad_clip) > 0:
-                accelerator.clip_grad_norm_(params, float(train_cfg.grad_clip))
+                grad_norm = accelerator.clip_grad_norm_(params, float(train_cfg.grad_clip))
+                grad_bad_local = int(not bool(torch.isfinite(grad_norm).item()))
+                grad_bad_any = _distributed_sum(grad_bad_local, dev) > 0
+                if grad_bad_any:
+                    if grad_bad_local:
+                        _append_jsonl(os.environ.get("EEGFM_MAINL1_DEBUG_LOG"), {
+                            "step": int(global_step),
+                            "reason": "nonfinite_grad_norm",
+                            "grad_norm": str(grad_norm.detach().float().cpu().item()) if getattr(grad_norm, 'numel', lambda: 1)() == 1 else "tensor",
+                        })
+                    optimizer.zero_grad(set_to_none=True)
+                    accum_tokens_global = 0
+                    accum_tokens_eff_global = 0
+                    continue
             optimizer.step()
             optimizer.zero_grad(set_to_none=True)
 
@@ -749,9 +810,9 @@ def run_train(args: argparse.Namespace) -> Dict[str, str]:
             global_step += 1
             pbar.update(1)
 
-            l1_den_local = max(1.0, float(num_tgt_local.detach().item()) * float(model_cfg.d_model))
-            l1_mean_local = float(l1_sum_local.detach().item()) / l1_den_local
-            l1_mean = _distributed_mean(l1_mean_local, dev)
+            l1_num_global = _distributed_sum_float(float(l1_sum_local.detach().item()), dev)
+            l1_den_global = max(1.0, float(_distributed_sum(int(n_finite_rows_local * int(model_cfg.d_model)), dev)))
+            l1_mean = float(l1_num_global) / float(l1_den_global)
 
             if (global_step - last_logged_step) >= int(train_cfg.log_every):
                 step_time = (time.time() - start_time) / max(1, global_step - last_logged_step)

@@ -10,7 +10,7 @@
   "post_split_shuffle": 128,
   "cache_max_bytes": 0,
   "eviction_interval": 8,
-  "tokens_per_batch": 12288,
+  "tokens_per_batch": 9216,
   "max_samples_per_batch": 256,
   "num_workers": 4,
   "mask_time_prob": 0.8,

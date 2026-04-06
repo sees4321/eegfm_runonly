@@ -114,6 +114,65 @@ def _append_jsonl(path: Optional[str], payload: Dict[str, object]) -> None:
         pass
 
 
+def _log_mainl1_nonfinite(
+    path: Optional[str],
+    step: int,
+    rank: int,
+    pred_tgt: torch.Tensor,
+    z_tgt: torch.Tensor,
+    valid_tgt: torch.Tensor,
+) -> None:
+    try:
+        pv = pred_tgt[valid_tgt].detach().float()
+        tv = z_tgt[valid_tgt].detach().float()
+
+        if pv.ndim == 1:
+            pv = pv[:, None]
+        if tv.ndim == 1:
+            tv = tv[:, None]
+
+        pred_isfinite = torch.isfinite(pv) if pv.numel() > 0 else torch.ones_like(pv, dtype=torch.bool)
+        tgt_isfinite = torch.isfinite(tv) if tv.numel() > 0 else torch.ones_like(tv, dtype=torch.bool)
+
+        pred_bad_rows = (~pred_isfinite).any(dim=-1) if pv.ndim == 2 and pv.shape[0] > 0 else torch.zeros((0,), device=pv.device, dtype=torch.bool)
+        tgt_bad_rows = (~tgt_isfinite).any(dim=-1) if tv.ndim == 2 and tv.shape[0] > 0 else torch.zeros((0,), device=tv.device, dtype=torch.bool)
+
+        def _absmax(x: torch.Tensor) -> float:
+            if x.numel() == 0:
+                return 0.0
+            return float(torch.nan_to_num(x, nan=0.0, posinf=0.0, neginf=0.0).abs().max().item())
+
+        payload = {
+            "event": "nonfinite_main_l1",
+            "step": int(step),
+            "rank": int(rank),
+            "n_valid_rows": int(pv.shape[0]) if pv.ndim >= 1 else 0,
+            "pred_bad_rows": int(pred_bad_rows.sum().item()),
+            "tgt_bad_rows": int(tgt_bad_rows.sum().item()),
+            "pred_nan_elems": int(torch.isnan(pv).sum().item()) if pv.numel() > 0 else 0,
+            "pred_inf_elems": int(torch.isinf(pv).sum().item()) if pv.numel() > 0 else 0,
+            "tgt_nan_elems": int(torch.isnan(tv).sum().item()) if tv.numel() > 0 else 0,
+            "tgt_inf_elems": int(torch.isinf(tv).sum().item()) if tv.numel() > 0 else 0,
+            "pred_absmax": _absmax(pv),
+            "tgt_absmax": _absmax(tv),
+            "pred_dtype": str(pred_tgt.dtype),
+            "tgt_dtype": str(z_tgt.dtype),
+            "pred_shape": list(pred_tgt.shape),
+            "tgt_shape": list(z_tgt.shape),
+            "first_pred_bad_rows": [int(i) for i in torch.nonzero(pred_bad_rows, as_tuple=False).flatten()[:8].cpu().tolist()],
+            "first_tgt_bad_rows": [int(i) for i in torch.nonzero(tgt_bad_rows, as_tuple=False).flatten()[:8].cpu().tolist()],
+        }
+        _append_jsonl(path, payload)
+    except Exception as e:
+        _append_jsonl(path, {
+            "event": "nonfinite_main_l1_log_failed",
+            "step": int(step),
+            "rank": int(rank),
+            "error_type": type(e).__name__,
+            "error": str(e),
+        })
+
+
 @torch.no_grad()
 def compute_logspec_view(
     patches: torch.Tensor,
@@ -610,33 +669,20 @@ def run_train(args: argparse.Namespace) -> Dict[str, str]:
                 )
 
                 valid_tgt = ~pad_tgt
-                pred_row_finite = torch.isfinite(pred_tgt).all(dim=-1)
-                tgt_row_finite = torch.isfinite(z_tgt).all(dim=-1)
-                main_row_good = valid_tgt & pred_row_finite & tgt_row_finite
-                n_valid_rows_local = int(valid_tgt.sum().item())
-                n_good_rows_local = int(main_row_good.sum().item())
-                bad_rows_local = int(n_valid_rows_local - n_good_rows_local)
-                if bad_rows_local > 0:
-                    _append_jsonl(os.environ.get("EEGFM_DEBUG_LOG"), {
-                        "event": "drop_nonfinite_main_rows",
-                        "step": int(global_step),
-                        "rank": int(accelerator.process_index),
-                        "n_valid_rows": n_valid_rows_local,
-                        "n_good_rows": n_good_rows_local,
-                        "bad_rows": bad_rows_local,
-                        "bad_rows_per_sample": (~(pred_row_finite & tgt_row_finite) & valid_tgt).sum(dim=1).detach().cpu().tolist(),
-                        "valid_rows_per_sample": valid_tgt.sum(dim=1).detach().cpu().tolist(),
-                        "coords_bad_channels_per_sample": (~torch.isfinite(coords).all(dim=-1)).sum(dim=1).detach().cpu().tolist(),
-                        "coord_absmax_per_sample": torch.nan_to_num(coords.abs(), nan=0.0, posinf=0.0, neginf=0.0).amax(dim=(1,2)).detach().cpu().tolist(),
-                    })
+                num_tgt_local = valid_tgt.sum().float().clamp_min(1.0)
 
-                num_tgt_local = main_row_good.sum().float().clamp_min(1.0)
-                if n_good_rows_local > 0:
-                    pred_main = pred_tgt[main_row_good].float()
-                    tgt_main = z_tgt[main_row_good].float()
-                    l1_sum_local = torch.abs(pred_main - tgt_main).sum()
-                else:
-                    l1_sum_local = pred_tgt.new_tensor(0.0, dtype=torch.float32)
+                diff = torch.abs(pred_tgt - z_tgt).masked_fill(pad_tgt[..., None], 0.0)
+                l1_sum_local = diff.sum().float()
+                if not torch.isfinite(l1_sum_local):
+                    _log_mainl1_nonfinite(
+                        os.environ.get("EEGFM_DEBUG_LOG"),
+                        step=int(global_step),
+                        rank=int(accelerator.process_index),
+                        pred_tgt=pred_tgt,
+                        z_tgt=z_tgt,
+                        valid_tgt=valid_tgt,
+                    )
+                    raise FloatingPointError(f"nonfinite main L1 at step {int(global_step)}")
                 loss_sum_local = l1_sum_local
 
                 spec_rel_loss = None
@@ -654,9 +700,8 @@ def run_train(args: argparse.Namespace) -> Dict[str, str]:
 
                     # Compute relational auxiliary loss outside autocast in fp32.
                     with torch.autocast(device_type=dev.type, enabled=False):
-                        valid_rel = valid_tgt & torch.isfinite(pred_tgt).all(dim=-1)
-                        patches_flat = cached_tgt_patches[valid_rel].float()
-                        z_flat = pred_tgt[valid_rel].float()
+                        patches_flat = cached_tgt_patches[valid_tgt].float()
+                        z_flat = pred_tgt[valid_tgt].float()
                         n_rel = int(z_flat.shape[0])
 
                         if n_rel >= 2 and torch.isfinite(patches_flat).all() and torch.isfinite(z_flat).all():
@@ -680,7 +725,7 @@ def run_train(args: argparse.Namespace) -> Dict[str, str]:
                                     tau_s=float(train_cfg.spec_rel_tau_s),
                                 )
                             else:
-                                _append_jsonl(os.environ.get("EEGFM_DEBUG_LOG"), {
+                                _append_jsonl(os.environ.get("EEGFM_SPECREL_DEBUG_LOG"), {
                                     "step": int(global_step),
                                     "reason": "nonfinite_after_projection",
                                     "n_rel": n_rel,
@@ -691,7 +736,7 @@ def run_train(args: argparse.Namespace) -> Dict[str, str]:
                                 })
                                 spec_rel_loss = None
                         else:
-                            _append_jsonl(os.environ.get("EEGFM_DEBUG_LOG"), {
+                            _append_jsonl(os.environ.get("EEGFM_SPECREL_DEBUG_LOG"), {
                                 "step": int(global_step),
                                 "reason": "degenerate_or_nonfinite_input",
                                 "n_rel": n_rel,
@@ -704,20 +749,13 @@ def run_train(args: argparse.Namespace) -> Dict[str, str]:
                         if torch.isfinite(spec_rel_loss):
                             loss_sum_local = loss_sum_local + spec_lam * spec_rel_loss
                         else:
-                            _append_jsonl(os.environ.get("EEGFM_DEBUG_LOG"), {
+                            _append_jsonl(os.environ.get("EEGFM_SPECREL_DEBUG_LOG"), {
                                 "step": int(global_step),
                                 "reason": "nonfinite_spec_rel_loss",
                             })
                             spec_rel_loss = None
 
                 loss_scaled = (loss_sum_local * float(weight) * float(world_size)) / (float(max(1, budget_tokens)) * float(model_cfg.d_model))
-                if not torch.isfinite(loss_scaled):
-                    _append_jsonl(os.environ.get("EEGFM_DEBUG_LOG"), {
-                        "event": "skip_nonfinite_loss_scaled",
-                        "step": int(global_step),
-                        "rank": int(accelerator.process_index),
-                    })
-                    loss_scaled = loss_scaled.new_tensor(0.0)
 
             accelerator.backward(loss_scaled)
 
@@ -749,7 +787,7 @@ def run_train(args: argparse.Namespace) -> Dict[str, str]:
             global_step += 1
             pbar.update(1)
 
-            l1_den_local = max(1.0, float(num_tgt_local.detach().item()) * float(model_cfg.d_model))
+            l1_den_local = max(1.0, float(local_target_tokens) * float(model_cfg.d_model))
             l1_mean_local = float(l1_sum_local.detach().item()) / l1_den_local
             l1_mean = _distributed_mean(l1_mean_local, dev)
 

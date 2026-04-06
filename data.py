@@ -36,7 +36,7 @@ COORD_KEY_ALIASES = (
     "coords", "coord", "coords.pyd", "coord.pyd",
     "xyz.npy", "xyz",
 )
-_BAD_SAMPLE_LOG = os.environ.get("EEGFM_BAD_SAMPLE_LOG", "")
+_BAD_SAMPLE_LOG = os.environ.get("EEGFM_BAD_SAMPLE_LOG", "EEGFM_DEBUG_LOG")
 _WARN_MAX = int(os.environ.get("EEGFM_BAD_SAMPLE_WARN_MAX", "32"))
 _WARN_COUNT = 0
 
@@ -287,7 +287,12 @@ def decode_sample(sample: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     if eeg.shape[1] <= 0:
         _report_bad_sample(sample, f"empty time dimension T={eeg.shape[1]} (picked {eeg_key!r})")
         return None
-
+    if not torch.isfinite(eeg).all():
+        _report_bad_sample(sample, "nonfinite_eeg")
+        return None
+    if not torch.isfinite(coord).all():
+        _report_bad_sample(sample, "nonfinite_coord")
+        return None
     return {"eeg": eeg.contiguous(), "coord": coord.contiguous()}
 
 
