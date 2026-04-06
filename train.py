@@ -22,7 +22,7 @@ from tqdm import tqdm
 
 from .augment import apply_student_augmentations
 from .config import EEGModelConfig, TrainConfig
-from .data import ShapeBatcher, build_webdataset, read_shards_txt
+from .data import ShapeBatcher, build_webdataset, read_shards_txt, build_shard_index_map
 from .model import EEGEncoder, CrossAttentionPredictor
 try:
     import webdataset as wds
@@ -80,6 +80,7 @@ def build_parser(add_help: bool = True) -> argparse.ArgumentParser:
     p.add_argument("--weight_decay", type=float, default=None)
     p.add_argument("--num_workers", type=int, default=None)
     p.add_argument("--run_name", type=str, default=None)
+    p.add_argument("--resume_shard_overlap", type=int, default=None)
     p.add_argument("--no_wandb", action="store_true")
     return p
 
@@ -388,55 +389,81 @@ def run_train(args: argparse.Namespace) -> Dict[str, str]:
 
     patch_samples = int(round(model_cfg.sample_rate * model_cfg.patch_seconds))
     hop_samples = max(1, int(round(model_cfg.sample_rate * model_cfg.patch_hop_seconds)))
-    shards = read_shards_txt(train_cfg.shards_txt)
-
-    ds = build_webdataset(
-        shards=shards,
+    all_shards = read_shards_txt(train_cfg.shards_txt)
+    shard_to_index = build_shard_index_map(
+        all_shards,
         cache_dir=train_cfg.cache_dir,
-        shard_shuffle=train_cfg.shard_shuffle,
-        sample_shuffle=train_cfg.sample_shuffle,
-        max_tokens=model_cfg.max_tokens,
-        patch_samples=patch_samples,
-        hop_samples=hop_samples,
         cache_max_bytes=train_cfg.cache_max_bytes,
-        post_split_shuffle=train_cfg.post_split_shuffle,
-        eviction_interval=train_cfg.eviction_interval,
-        seed=train_cfg.seed,
     )
-    ds_batched = ShapeBatcher(
-        dataset=ds,
-        tokens_per_batch=train_cfg.tokens_per_batch,
-        max_samples_per_batch=train_cfg.max_samples_per_batch,
-        patch_samples=patch_samples,
-        hop_samples=hop_samples,
-        target_mask_cfg=dict(
-            mask_time_prob=float(train_cfg.mask_time_prob),
-            mask_spatial_prob=float(train_cfg.mask_spatial_prob),
-            time_ratio_range=(float(train_cfg.time_mask_ratio_min), float(train_cfg.time_mask_ratio_max)),
-            spatial_ratio_range=(float(train_cfg.spatial_mask_ratio_min), float(train_cfg.spatial_mask_ratio_max)),
-            mask_dilate_time=int(train_cfg.mask_dilate_time),
-        ),
-        max_wait_samples=5000,
-        flush_check_every=256,
-        max_pending_samples=512,
-        max_pending_tokens=0,
-        shuffle_within_bucket=True,
-        yield_incomplete=False,
+    resume_shard_overlap = int(
+        args.resume_shard_overlap
+        if getattr(args, "resume_shard_overlap", None) is not None
+        else os.environ.get("EEGFM_RESUME_SHARD_OVERLAP", "8")
     )
-    loader = wds.WebLoader(
-        ds_batched,
-        batch_size=None,
-        num_workers=train_cfg.num_workers,
-        pin_memory=True,
-        persistent_workers=(train_cfg.num_workers > 0),
-        prefetch_factor=4 if train_cfg.num_workers > 0 else None,
-    )
+    resume_shard_overlap = max(0, int(resume_shard_overlap))
+    resume_next_shard_index = int(trainer_state.get("data_next_shard_index", 0))
+    resume_next_shard_index = max(0, min(len(all_shards), resume_next_shard_index))
+    resume_midpass_active = bool(train_cfg.resume_from) and (resume_next_shard_index > 0)
+    active_start_shard_index = max(0, min(len(all_shards), resume_next_shard_index) - resume_shard_overlap) if resume_midpass_active else 0
+    active_shards = all_shards[active_start_shard_index:] if active_start_shard_index > 0 else all_shards
+
+    def _make_loader(shards_subset):
+        ds = build_webdataset(
+            shards=shards_subset,
+            cache_dir=train_cfg.cache_dir,
+            shard_shuffle=train_cfg.shard_shuffle,
+            sample_shuffle=train_cfg.sample_shuffle,
+            max_tokens=model_cfg.max_tokens,
+            patch_samples=patch_samples,
+            hop_samples=hop_samples,
+            cache_max_bytes=train_cfg.cache_max_bytes,
+            post_split_shuffle=train_cfg.post_split_shuffle,
+            eviction_interval=train_cfg.eviction_interval,
+            seed=train_cfg.seed,
+            shard_to_index=shard_to_index,
+        )
+        ds_batched = ShapeBatcher(
+            dataset=ds,
+            tokens_per_batch=train_cfg.tokens_per_batch,
+            max_samples_per_batch=train_cfg.max_samples_per_batch,
+            patch_samples=patch_samples,
+            hop_samples=hop_samples,
+            target_mask_cfg=dict(
+                mask_time_prob=float(train_cfg.mask_time_prob),
+                mask_spatial_prob=float(train_cfg.mask_spatial_prob),
+                time_ratio_range=(float(train_cfg.time_mask_ratio_min), float(train_cfg.time_mask_ratio_max)),
+                spatial_ratio_range=(float(train_cfg.spatial_mask_ratio_min), float(train_cfg.spatial_mask_ratio_max)),
+                mask_dilate_time=int(train_cfg.mask_dilate_time),
+            ),
+            max_wait_samples=5000,
+            flush_check_every=256,
+            max_pending_samples=512,
+            max_pending_tokens=0,
+            shuffle_within_bucket=True,
+            yield_incomplete=False,
+        )
+        return wds.WebLoader(
+            ds_batched,
+            batch_size=None,
+            num_workers=train_cfg.num_workers,
+            pin_memory=True,
+            persistent_workers=(train_cfg.num_workers > 0),
+            prefetch_factor=4 if train_cfg.num_workers > 0 else None,
+        )
+
+    loader = _make_loader(active_shards)
 
     if accelerator.is_main_process:
         enc_params = count_params(accelerator.unwrap_model(student))
         pred_params = count_params(accelerator.unwrap_model(predictor))
         rel_params = count_params(accelerator.unwrap_model(rel_proj)) if rel_proj is not None else 0
         print(f"[params] encoder={enc_params/1e6:.3f}M predictor={pred_params/1e6:.3f}M aux={rel_params/1e6:.3f}M")
+        if resume_midpass_active:
+            print(
+                f"[data-resume] mid-pass resume enabled: next_shard_index={resume_next_shard_index} "
+                f"overlap={resume_shard_overlap} start_from={active_start_shard_index} "
+                f"remaining_shards={len(active_shards)}/{len(all_shards)}"
+            )
 
     budget_tokens = int(train_cfg.tokens_per_update)
     total_sched_tokens = int(train_cfg.max_steps) * budget_tokens
@@ -447,6 +474,7 @@ def run_train(args: argparse.Namespace) -> Dict[str, str]:
     global_step = int(trainer_state.get("global_step", 0))
     passes_completed = int(trainer_state.get("passes_completed", 0))
     tokens_seen_total = int(trainer_state.get("tokens_seen_total", 0))
+    current_pass_last_shard_seen = int(trainer_state.get("data_last_shard_index_seen", active_start_shard_index - 1))
 
     opt_zero = True
     if opt_zero:
@@ -498,11 +526,22 @@ def run_train(args: argparse.Namespace) -> Dict[str, str]:
                             "global_step": global_step,
                             "passes_completed": passes_completed,
                             "tokens_seen_total": tokens_seen_total,
+                            "data_next_shard_index": 0,
+                            "data_last_shard_index_seen": -1,
+                            "data_resume_overlap": int(resume_shard_overlap),
+                            "data_shards_total": int(len(all_shards)),
                         },
                     )
             pass_input_tokens_global = 0
             pass_target_tokens_global = 0
             pass_context_tokens_global = 0
+            current_pass_last_shard_seen = -1
+            if resume_midpass_active:
+                loader = _make_loader(all_shards)
+                resume_midpass_active = False
+                active_start_shard_index = 0
+                if accelerator.is_main_process:
+                    print("[data-resume] switched back to full shard list for the next pass")
             it = iter(loader)
             continue
 
@@ -532,6 +571,20 @@ def run_train(args: argparse.Namespace) -> Dict[str, str]:
         pass_input_tokens_global += global_input_tokens
         pass_target_tokens_global += global_target_tokens
         pass_context_tokens_global += global_context_tokens
+
+        shard_indices_cpu = batch.get("shard_indices", None)
+        if shard_indices_cpu is not None:
+            try:
+                if isinstance(shard_indices_cpu, torch.Tensor):
+                    valid_si = shard_indices_cpu[shard_indices_cpu >= 0]
+                    if valid_si.numel() > 0:
+                        current_pass_last_shard_seen = max(current_pass_last_shard_seen, int(valid_si.max().item()))
+                else:
+                    valid_si = [int(s) for s in shard_indices_cpu if int(s) >= 0]
+                    if len(valid_si) > 0:
+                        current_pass_last_shard_seen = max(current_pass_last_shard_seen, max(valid_si))
+            except Exception:
+                pass
 
         if accum_tokens_global == 0 and global_target_tokens <= 0:
             will_step = True
@@ -797,6 +850,10 @@ def run_train(args: argparse.Namespace) -> Dict[str, str]:
                             "global_step": global_step,
                             "passes_completed": passes_completed,
                             "tokens_seen_total": tokens_seen_total,
+                            "data_next_shard_index": int(min(len(all_shards), max(0, current_pass_last_shard_seen + 1))),
+                            "data_last_shard_index_seen": int(current_pass_last_shard_seen),
+                            "data_resume_overlap": int(resume_shard_overlap),
+                            "data_shards_total": int(len(all_shards)),
                         },
                     )
 
@@ -817,6 +874,10 @@ def run_train(args: argparse.Namespace) -> Dict[str, str]:
                 "global_step": global_step,
                 "passes_completed": passes_completed,
                 "tokens_seen_total": tokens_seen_total,
+                "data_next_shard_index": int(min(len(all_shards), max(0, current_pass_last_shard_seen + 1))),
+                "data_last_shard_index_seen": int(current_pass_last_shard_seen),
+                "data_resume_overlap": int(resume_shard_overlap),
+                "data_shards_total": int(len(all_shards)),
             },
         )
     accelerator.wait_for_everyone()

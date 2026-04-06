@@ -36,7 +36,7 @@ COORD_KEY_ALIASES = (
     "coords", "coord", "coords.pyd", "coord.pyd",
     "xyz.npy", "xyz",
 )
-_BAD_SAMPLE_LOG = os.environ.get("EEGFM_BAD_SAMPLE_LOG", "EEGFM_DEBUG_LOG")
+_BAD_SAMPLE_LOG = os.environ.get("EEGFM_BAD_SAMPLE_LOG", os.environ.get("EEGFM_DEBUG_LOG", ""))
 _WARN_MAX = int(os.environ.get("EEGFM_BAD_SAMPLE_WARN_MAX", "32"))
 _WARN_COUNT = 0
 
@@ -48,6 +48,41 @@ def read_shards_txt(path: str) -> List[str]:
     if not shards:
         raise RuntimeError(f"No shard paths found in {path}")
     return shards
+
+def _norm_path(p: Any) -> str:
+    try:
+        return os.path.realpath(os.path.expanduser(str(p)))
+    except Exception:
+        return str(p)
+
+
+def build_shard_index_map(shards: List[str], cache_dir: str = "", cache_max_bytes: int = 0) -> Dict[str, int]:
+    m: Dict[str, int] = {}
+    cache_helper = None
+    if cache_dir and cache_max_bytes > 0:
+        try:
+            cache_helper = LRUShardCache(cache_dir=cache_dir, max_bytes=cache_max_bytes, eviction_interval=8)
+        except Exception:
+            cache_helper = None
+    for i, s in enumerate(shards):
+        ns = _norm_path(s)
+        m[ns] = int(i)
+        if cache_helper is not None:
+            try:
+                cached = os.path.join(cache_helper.cache_dir, cache_helper._cache_name(s))
+                m[_norm_path(cached)] = int(i)
+            except Exception:
+                pass
+    return m
+
+
+def _attach_shard_index(sample: Dict[str, Any], shard_to_index: Dict[str, int]) -> Dict[str, Any]:
+    try:
+        u = sample.get("__url__", "")
+        sample["__shard_index__"] = int(shard_to_index.get(_norm_path(u), -1))
+    except Exception:
+        sample["__shard_index__"] = -1
+    return sample
 
 
 @contextmanager
@@ -293,7 +328,13 @@ def decode_sample(sample: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     if not torch.isfinite(coord).all():
         _report_bad_sample(sample, "nonfinite_coord")
         return None
-    return {"eeg": eeg.contiguous(), "coord": coord.contiguous()}
+    return {
+        "eeg": eeg.contiguous(),
+        "coord": coord.contiguous(),
+        "__url__": sample.get("__url__"),
+        "__key__": sample.get("__key__"),
+        "__shard_index__": int(sample.get("__shard_index__", -1)),
+    }
 
 
 def _flatmap_stage(mapper):
@@ -419,6 +460,9 @@ def collate_stack(
         "c_tgt": c_tgt,
         "t_tgt": t_tgt,
         "pad_tgt": pad_tgt,
+        "shard_indices": torch.tensor([int(b.get("__shard_index__", -1)) for b in batch], dtype=torch.long),
+        "sample_keys": [str(b.get("__key__", "")) for b in batch],
+        "sample_urls": [str(b.get("__url__", "")) for b in batch],
     }
 
 
@@ -579,6 +623,7 @@ def build_webdataset(
     post_split_shuffle: int = 128,
     eviction_interval: int = 8,
     seed: int = 0,
+    shard_to_index: Optional[Dict[str, int]] = None,
 ) -> Iterable[Dict[str, Any]]:
     if wds is None:
         raise RuntimeError("webdataset is not installed")
@@ -588,6 +633,8 @@ def build_webdataset(
         cache = LRUShardCache(cache_dir=cache_dir, max_bytes=cache_max_bytes, eviction_interval=eviction_interval)
 
     src = wds.SimpleShardList(shards) if hasattr(wds, "SimpleShardList") else wds.shardlists.SimpleShardList(shards)
+    if shard_to_index is None:
+        shard_to_index = build_shard_index_map(shards, cache_dir=cache_dir, cache_max_bytes=cache_max_bytes)
     pipeline = [src]
     if shard_shuffle > 0:
         if hasattr(wds, "detshuffle"):
@@ -601,6 +648,7 @@ def build_webdataset(
 
     pipeline += [
         wds.tarfile_to_samples(handler=wds.ignore_and_continue),
+        wds.map(lambda s: _attach_shard_index(s, shard_to_index)),
         wds.shuffle(sample_shuffle),
         wds.decode(),
         wds.map(decode_sample),
