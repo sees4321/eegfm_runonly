@@ -697,13 +697,19 @@ def run_train(args: argparse.Namespace) -> Dict[str, str]:
                 if rel_proj is not None:
                     warm = int(train_cfg.spec_rel_warmup_steps)
                     ramp = int(train_cfg.spec_rel_ramp_steps)
+                    decay = int(train_cfg.spec_rel_decay_step)
                     if global_step < warm:
                         spec_lam = 0.0
-                    elif ramp > 0:
+                    elif global_step < warm + ramp:
                         u = min(1.0, float(global_step - warm) / float(ramp))
                         spec_lam = float(train_cfg.spec_rel_weight) * u
-                    else:
+                    elif global_step < decay:
                         spec_lam = float(train_cfg.spec_rel_weight)
+                    else:
+                        decay_span = max(1, train_cfg.max_steps - decay)
+                        u = float(global_step - decay) / float(decay_span)
+                        u = min(max(u, 0.0), 1.0)
+                        spec_lam = float(train_cfg.spec_rel_weight + (train_cfg.spec_rel_final_weight - train_cfg.spec_rel_weight)*u)
 
                     # Compute relational auxiliary loss outside autocast in fp32.
                     with torch.autocast(device_type=dev.type, enabled=False):

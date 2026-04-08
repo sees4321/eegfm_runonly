@@ -134,6 +134,8 @@ class TrainConfig:
     spec_rel_weight: float = 0.05
     spec_rel_warmup_steps: int = 1500
     spec_rel_ramp_steps: int = 3000
+    spec_rel_decay_step: int = 16000
+    spec_rel_final_weight: float = 0.005
 
     # Logging / checkpoints
     output_dir: str = "./checkpoints/eegfm"
