@@ -57,8 +57,12 @@ class EMAUpdater:
         self.m = float(m0)
 
     def set_momentum(self, step: int, total_steps: int, m0: float, m1: float) -> None:
-        progress = step / max(1, total_steps)
-        self.m = float(m1 - (m1 - m0) * (0.5 * (1.0 + math.cos(math.pi * progress))))
+        if total_steps - step <= 5000:
+            progress = step / max(1, total_steps)
+            self.m = float(m1 - (m1 - m0) * (0.5 * (1.0 + math.cos(math.pi * progress))))
+        else:
+            progress = 30 / 35
+            self.m = float(m1 - (m1 - m0) * (0.5 * (1.0 + math.cos(math.pi * progress))))
 
     @torch.no_grad()
     def update(self) -> None:
@@ -203,25 +207,6 @@ def token_wcc_lr(tokens_next: int, warmup_tokens: int, total_tokens: int, cooldo
         frac = float(td) / float(max(1, C))
         return float(base_lr) + (float(min_lr) - float(base_lr)) * frac
     return float(min_lr)
-
-def token_warmup_cosine_lr(tokens_next: int, warmup_tokens: int, total_tokens: int, base_lr: float, min_lr: float = 0.0,) -> float:
-    t = max(0, int(tokens_next))
-    T = max(1, int(total_tokens))
-    W = min(max(0, int(warmup_tokens)), T)
-
-    # 1) warmup: 0 -> base_lr
-    if W > 0 and t < W:
-        return float(base_lr) * float(t) / float(max(1, W))
-    remain = max(1, T - W)  # warmup 이후 남은 길이
-
-    # 2) cosine decay: base_lr -> min_lr
-    if t < T:
-        td = t - W
-        frac = float(td) / float(remain)   # 0 ~ 1
-        cos_frac = 0.5 * (1.0 + math.cos(math.pi * frac))
-        return float(min_lr) + (float(base_lr) - float(min_lr)) * cos_frac
-
-    return float(min_lr) # 3) training 끝난 뒤
 
 
 def maybe_compile_modules(student: EEGEncoder, predictor: CrossAttentionPredictor, train_cfg: TrainConfig) -> None:
@@ -725,7 +710,7 @@ def run_train(args: argparse.Namespace) -> Dict[str, str]:
                     elif global_step < decay:
                         spec_lam = float(train_cfg.spec_rel_weight)
                     else:
-                        decay_span = max(1, train_cfg.max_steps - decay)
+                        decay_span = max(1, 35000 - decay)
                         u = float(global_step - decay) / float(decay_span)
                         u = min(max(u, 0.0), 1.0)
                         spec_lam = float(train_cfg.spec_rel_weight + (train_cfg.spec_rel_final_weight - train_cfg.spec_rel_weight)*u)
@@ -804,21 +789,14 @@ def run_train(args: argparse.Namespace) -> Dict[str, str]:
 
         if will_step:
             tokens_next = int(tokens_seen_total) + int(accum_tokens_eff_global)
-            lr_now = token_warmup_cosine_lr(
+            lr_now = token_wcc_lr(
                 tokens_next=tokens_next,
                 warmup_tokens=warmup_tokens,
                 total_tokens=total_sched_tokens,
+                cooldown_tokens=cooldown_tokens,
                 base_lr=float(train_cfg.lr),
                 min_lr=float(train_cfg.min_lr),
             )
-            # lr_now = token_wcc_lr(
-            #     tokens_next=tokens_next,
-            #     warmup_tokens=warmup_tokens,
-            #     total_tokens=total_sched_tokens,
-            #     cooldown_tokens=cooldown_tokens,
-            #     base_lr=float(train_cfg.lr),
-            #     min_lr=float(train_cfg.min_lr),
-            # )
             for pg in optimizer.param_groups:
                 pg["lr"] = lr_now
 

@@ -204,25 +204,6 @@ def token_wcc_lr(tokens_next: int, warmup_tokens: int, total_tokens: int, cooldo
         return float(base_lr) + (float(min_lr) - float(base_lr)) * frac
     return float(min_lr)
 
-def token_warmup_cosine_lr(tokens_next: int, warmup_tokens: int, total_tokens: int, base_lr: float, min_lr: float = 0.0,) -> float:
-    t = max(0, int(tokens_next))
-    T = max(1, int(total_tokens))
-    W = min(max(0, int(warmup_tokens)), T)
-
-    # 1) warmup: 0 -> base_lr
-    if W > 0 and t < W:
-        return float(base_lr) * float(t) / float(max(1, W))
-    remain = max(1, T - W)  # warmup 이후 남은 길이
-
-    # 2) cosine decay: base_lr -> min_lr
-    if t < T:
-        td = t - W
-        frac = float(td) / float(remain)   # 0 ~ 1
-        cos_frac = 0.5 * (1.0 + math.cos(math.pi * frac))
-        return float(min_lr) + (float(base_lr) - float(min_lr)) * cos_frac
-
-    return float(min_lr) # 3) training 끝난 뒤
-
 
 def maybe_compile_modules(student: EEGEncoder, predictor: CrossAttentionPredictor, train_cfg: TrainConfig) -> None:
     if not bool(train_cfg.use_torch_compile):
@@ -387,7 +368,7 @@ def run_train(args: argparse.Namespace) -> Dict[str, str]:
         rel_proj = accelerator.prepare(rel_proj)
 
     teacher.to(dev)
-    ema_updater = EMAUpdater(teacher, accelerator.unwrap_model(student), train_cfg.ema_momentum)
+    ema_updater = EMAUpdater(teacher, accelerator.unwrap_model(student), train_cfg.ema_momentum_final)
 
     trainer_state = {
         "global_step": 0,
@@ -712,23 +693,8 @@ def run_train(args: argparse.Namespace) -> Dict[str, str]:
                 loss_sum_local = l1_sum_local
 
                 spec_rel_loss = None
-                spec_lam = 0.0
+                spec_lam = float(train_cfg.spec_rel_final_weight) 
                 if rel_proj is not None:
-                    warm = int(train_cfg.spec_rel_warmup_steps)
-                    ramp = int(train_cfg.spec_rel_ramp_steps)
-                    decay = int(train_cfg.spec_rel_decay_step)
-                    if global_step < warm:
-                        spec_lam = 0.0
-                    elif global_step < warm + ramp:
-                        u = min(1.0, float(global_step - warm) / float(ramp))
-                        spec_lam = float(train_cfg.spec_rel_weight) * u
-                    elif global_step < decay:
-                        spec_lam = float(train_cfg.spec_rel_weight)
-                    else:
-                        decay_span = max(1, train_cfg.max_steps - decay)
-                        u = float(global_step - decay) / float(decay_span)
-                        u = min(max(u, 0.0), 1.0)
-                        spec_lam = float(train_cfg.spec_rel_weight + (train_cfg.spec_rel_final_weight - train_cfg.spec_rel_weight)*u)
 
                     # Compute relational auxiliary loss outside autocast in fp32.
                     with torch.autocast(device_type=dev.type, enabled=False):
@@ -804,21 +770,7 @@ def run_train(args: argparse.Namespace) -> Dict[str, str]:
 
         if will_step:
             tokens_next = int(tokens_seen_total) + int(accum_tokens_eff_global)
-            lr_now = token_warmup_cosine_lr(
-                tokens_next=tokens_next,
-                warmup_tokens=warmup_tokens,
-                total_tokens=total_sched_tokens,
-                base_lr=float(train_cfg.lr),
-                min_lr=float(train_cfg.min_lr),
-            )
-            # lr_now = token_wcc_lr(
-            #     tokens_next=tokens_next,
-            #     warmup_tokens=warmup_tokens,
-            #     total_tokens=total_sched_tokens,
-            #     cooldown_tokens=cooldown_tokens,
-            #     base_lr=float(train_cfg.lr),
-            #     min_lr=float(train_cfg.min_lr),
-            # )
+            lr_now = train_cfg.lr
             for pg in optimizer.param_groups:
                 pg["lr"] = lr_now
 
@@ -827,7 +779,7 @@ def run_train(args: argparse.Namespace) -> Dict[str, str]:
             optimizer.step()
             optimizer.zero_grad(set_to_none=True)
 
-            ema_updater.set_momentum(global_step, int(train_cfg.max_steps), float(train_cfg.ema_momentum), float(train_cfg.ema_momentum_final))
+            # ema_updater.set_momentum(global_step, int(train_cfg.max_steps), float(train_cfg.ema_momentum), float(train_cfg.ema_momentum_final))
             ema_updater.update()
 
             tokens_seen_total = tokens_next
