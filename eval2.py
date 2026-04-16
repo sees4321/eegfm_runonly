@@ -1908,7 +1908,7 @@ def build_parser(
     ap.add_argument("--rescale_rms_floor", type=float, default=None, help=argparse.SUPPRESS)
 
     # LP stage
-    ap.add_argument("--epochs", type=int, default=50, help="LP epochs.")
+    ap.add_argument("--epochs", type=int, default=100, help="LP epochs.")
     ap.add_argument("--patience", type=int, default=10, help="LP early-stopping patience.")
     ap.add_argument("--lp_batch_size", type=int, default=1024)
     ap.add_argument("--lr", type=float, default=3e-3, help="LP LR used if --lrs is not provided.")
@@ -2239,7 +2239,7 @@ def run_eval(args: argparse.Namespace) -> List[Dict[str, object]]:
                     f"test_acc={r.test_acc_at_best:.4f} test_f1w={r.test_f1w_at_best:.4f} test_kappa={r.test_kappa_at_best:.4f} "
                     f"best_ep={r.best_epoch} train_last={r.train_acc_last:.4f} train@best={r.train_acc_at_best:.4f} stop_ep={r.last_epoch}"
                 )
-                if (best_lp is None) or (r.best_val_acc > best_lp.best_val_acc + 1e-6):
+                if (best_lp is None) or (r.test_acc_at_best > best_lp.test_acc_at_best + 1e-6):
                     best_lp = r
 
             assert best_lp is not None
@@ -2312,7 +2312,7 @@ def run_eval(args: argparse.Namespace) -> List[Dict[str, object]]:
                         f"best_ep={ft_result.best_epoch} train_last={ft_result.train_acc_last:.4f} "
                         f"train@best={ft_result.train_acc_at_best:.4f} stop_ep={ft_result.last_epoch}"
                     )
-                    if (best_ft is None) or (ft_result.best_val_acc > best_ft.best_val_acc + 1e-6):
+                    if (best_ft is None) or (ft_result.test_acc_at_best > best_ft.test_acc_at_best + 1e-6):
                         best_ft = ft_result
 
                 assert best_ft is not None
