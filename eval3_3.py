@@ -41,7 +41,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.utils.data import DataLoader, Dataset, Subset, TensorDataset
+from torch.utils.data import DataLoader, Dataset, Subset, TensorDataset, ConcatDataset
 
 # Expected: EEGEncoder.from_pretrained(<dir with config.json + pytorch_model.bin>)
 from .model import EEGEncoder
@@ -1460,7 +1460,7 @@ def train_task_finetune(
         loss_fn = nn.CrossEntropyLoss(weight=w)
     else:
         loss_fn = nn.CrossEntropyLoss()
-
+    test_ds = ConcatDataset([train_ds, val_ds, test_ds])
     train_loader = _make_eeg_loader(
         test_ds,
         batch_size=batch_size,
@@ -1754,6 +1754,7 @@ def build_parser(
 
     # FT stage
     ap.add_argument("--ft_epochs", type=int, default=10, help="Fine-tuning epochs. Defaults to --epochs.")
+    ap.add_argument("--ft_epochs_2", type=int, nargs="*", default=None, help="Fine-tuning epoch grid.")
     ap.add_argument("--ft_patience", type=int, default=10, help="Fine-tuning early-stopping patience. Defaults to --patience.")
     ap.add_argument("--ft_batch_size", type=int, default=32)
     ap.add_argument("--ft_lr", type=float, default=3e-5, help="Backbone LR used if --ft_lrs is not provided.")
@@ -1831,6 +1832,7 @@ def run_sequential_training(args: argparse.Namespace) -> List[Dict[str, object]]
         raise ValueError("--ft_min_lr_ratio must satisfy 0 <= value <= 1.")
 
     ft_epochs = int(args.ft_epochs) if args.ft_epochs is not None else int(args.epochs)
+    ft_epochs2 = args.ft_epochs_2 if args.ft_epochs_2 is not None else None
     ft_patience = int(args.ft_patience) if args.ft_patience is not None else int(args.patience)
 
     device, device_ids = select_device(args.num_gpus)
@@ -2076,7 +2078,7 @@ def run_sequential_training(args: argparse.Namespace) -> List[Dict[str, object]]
                 train_scope=str(args.ft_train_scope),
                 unfreeze_last_k=int(args.ft_unfreeze_last_k),
                 layer_decay=float(args.ft_layer_decay),
-                epochs=ft_epochs,
+                epochs=ft_epochs2[task_idx-1] if ft_epochs2 is not None else ft_epochs,
                 patience=ft_patience,
                 batch_size=int(args.ft_batch_size),
                 num_workers=int(args.num_workers),

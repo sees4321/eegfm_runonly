@@ -58,6 +58,7 @@ import random
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple
+from tqdm import tqdm
 
 import numpy as np
 import torch
@@ -301,7 +302,7 @@ class EEGClassifier(nn.Module):
         return self.head(feat)
 
 class EEGHead(nn.Module):
-    def __init__(self, feat_dim:int, n_classes: int, layers=3):
+    def __init__(self, feat_dim:int, n_classes: int, layers=2):
         super().__init__()
         if layers == 3:
             self.head = nn.Sequential(
@@ -314,6 +315,7 @@ class EEGHead(nn.Module):
         elif layers == 2:
             self.head = nn.Sequential(
                 nn.Linear(int(feat_dim), int(feat_dim // 4)),
+                nn.LayerNorm(int(feat_dim // 4)),
                 nn.ELU(),
                 nn.Linear(int(feat_dim // 4), int(n_classes)),
             )
@@ -1737,7 +1739,7 @@ def train_lpft_finetune(
 
     autocast = torch.amp.autocast
 
-    for ep in range(1, epochs + 1):
+    for ep in tqdm(range(1, epochs + 1), dynamic_ncols=True):
         model.train()
         _set_lpft_train_mode(base_model, trainable_encoder_modules)
         correct_tr = 0
@@ -1892,7 +1894,7 @@ def build_parser(
     ap.add_argument(
         "--feat_norm",
         type=str,
-        default="zscore",
+        default="none",
         choices=["none", "zscore", "l2"],
         help="Normalize pooled features using frozen train-set statistics for LP and LPFT initialization.",
     )
@@ -1909,7 +1911,7 @@ def build_parser(
 
     # LP stage
     ap.add_argument("--epochs", type=int, default=100, help="LP epochs.")
-    ap.add_argument("--patience", type=int, default=10, help="LP early-stopping patience.")
+    ap.add_argument("--patience", type=int, default=15, help="LP early-stopping patience.")
     ap.add_argument("--lp_batch_size", type=int, default=1024)
     ap.add_argument("--lr", type=float, default=3e-3, help="LP LR used if --lrs is not provided.")
     ap.add_argument("--lrs", type=float, nargs="*", default=None, help="LP LR grid (AdamW).")
@@ -1946,7 +1948,7 @@ def build_parser(
     ap.add_argument(
         "--ft_layer_decay",
         type=float,
-        default=0.75,
+        default=1.0,# 0.75,
         help="Layer-wise LR decay across trainable encoder modules. 1.0 disables layer-wise decay.",
     )
     ap.add_argument("--ft_weight_decay", type=float, default=0.05)
