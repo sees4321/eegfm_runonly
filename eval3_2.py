@@ -41,7 +41,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.utils.data import DataLoader, Dataset, Subset, TensorDataset
+from torch.utils.data import DataLoader, Dataset, Subset, TensorDataset, ConcatDataset
 
 # Expected: EEGEncoder.from_pretrained(<dir with config.json + pytorch_model.bin>)
 from .model import EEGEncoder
@@ -1460,7 +1460,7 @@ def train_task_finetune(
         loss_fn = nn.CrossEntropyLoss(weight=w)
     else:
         loss_fn = nn.CrossEntropyLoss()
-
+    test_ds = ConcatDataset([train_ds, val_ds, test_ds])
     train_loader = _make_eeg_loader(
         test_ds,
         batch_size=batch_size,
