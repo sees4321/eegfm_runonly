@@ -636,7 +636,7 @@ def evaluate_head(
     if binary_test_metrics and n_classes == 2:
         y_true_parts: List[np.ndarray] = []
         y_score_parts: List[np.ndarray] = []
-        y_predict_parts: List[np.ndarray] = []
+        y_pred_parts: List[np.ndarray] = []
         # correct = 0
         total = 0
 
