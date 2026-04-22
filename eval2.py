@@ -551,8 +551,11 @@ def cohen_kappa_from_cm(cm: torch.Tensor) -> float:
 @torch.no_grad()
 def metrics_from_cm(cm: torch.Tensor) -> Metrics:
     cmf = cm.to(torch.float32)
-    total = float(cmf.sum().item())
-    acc = 0.0 if total <= 0.0 else float(torch.diagonal(cmf).sum().item() / total)
+    # total = float(cmf.sum().item())
+    # acc = 0.0 if total <= 0.0 else float(torch.diagonal(cmf).sum().item() / total)
+    support = cmf.sum(dim=1)
+    per_class_acc = torch.nan_to_num(torch.diagonal(cmf) / support, nan=0.0)
+    acc = float(per_class_acc.mean().item())
     f1w = weighted_f1_from_cm(cmf)
     kappa = cohen_kappa_from_cm(cmf)
     return Metrics(acc=acc, f1w=f1w, kappa=kappa)
@@ -633,7 +636,8 @@ def evaluate_head(
     if binary_test_metrics and n_classes == 2:
         y_true_parts: List[np.ndarray] = []
         y_score_parts: List[np.ndarray] = []
-        correct = 0
+        y_predict_parts: List[np.ndarray] = []
+        # correct = 0
         total = 0
 
         for xb, yb in loader:
@@ -643,17 +647,32 @@ def evaluate_head(
             pred = logits.argmax(dim=-1)
             scores = (logits[:, 1] - logits[:, 0]).detach().float().cpu().numpy()
 
-            correct += int((pred == yb).sum().item())
+            # correct += int((pred == yb).sum().item())
             total += int(yb.numel())
             y_true_parts.append(yb.detach().cpu().numpy())
             y_score_parts.append(scores)
+            y_pred_parts.append(pred.detach().cpu().numpy()) # 추가
 
         if total == 0:
             return Metrics(acc=0.0, f1w=float("nan"), kappa=float("nan"))
 
         y_true = np.concatenate(y_true_parts, axis=0)
         y_score = np.concatenate(y_score_parts, axis=0)
-        acc = float(correct / total)
+        y_pred = np.concatenate(y_pred_parts, axis=0)  # 배열로 병합
+        # acc = float(correct / total)
+        # --- Balanced Accuracy 계산 ---
+        # 클래스별 인덱스 추출
+        idx_0 = (y_true == 0)
+        idx_1 = (y_true == 1)
+
+        # 클래스 0 (Negative)의 정확도 (Specificity)
+        acc_0 = (y_pred[idx_0] == 0).sum() / idx_0.sum() if idx_0.sum() > 0 else 0.0
+        
+        # 클래스 1 (Positive)의 정확도 (Recall/Sensitivity)
+        acc_1 = (y_pred[idx_1] == 1).sum() / idx_1.sum() if idx_1.sum() > 0 else 0.0
+
+        # 두 클래스 정확도의 단순 평균 (Balanced Acc)
+        acc = float((acc_0 + acc_1) / 2.0)
         auc_pr = binary_average_precision_score(y_true, y_score)
         auroc = binary_auroc_score(y_true, y_score)
         return Metrics(acc=acc, f1w=auc_pr, kappa=auroc)
@@ -1911,7 +1930,7 @@ def build_parser(
 
     # LP stage
     ap.add_argument("--epochs", type=int, default=100, help="LP epochs.")
-    ap.add_argument("--patience", type=int, default=15, help="LP early-stopping patience.")
+    ap.add_argument("--patience", type=int, default=10, help="LP early-stopping patience.")
     ap.add_argument("--lp_batch_size", type=int, default=1024)
     ap.add_argument("--lr", type=float, default=3e-3, help="LP LR used if --lrs is not provided.")
     ap.add_argument("--lrs", type=float, nargs="*", default=None, help="LP LR grid (AdamW).")
