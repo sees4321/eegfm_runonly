@@ -10,7 +10,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from .config import EEGModelConfig
+from config import EEGModelConfig
 
 
 def _gather_channel_features(x_ch: torch.Tensor, c_idx: torch.Tensor) -> torch.Tensor:
