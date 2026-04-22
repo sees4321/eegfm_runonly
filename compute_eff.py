@@ -15,6 +15,8 @@ try:
 except ImportError:
     FlopCountAnalysis = None
 
+# python profile.py --configs model_20M.json model_45M.json model_hybrid.json --batch_size 16 --seq_len 4096
+# python profile.py --configs ... --batch_size 16 --seq_len 1024 (4096의 25%)
 
 class ProfileWrapper(nn.Module):
     """
