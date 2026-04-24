@@ -16,7 +16,7 @@
   "encoder_arch": "full",
   "full_attn_every": 4,
   "full_attn_use_spatial_bias": false,
-  "spatial_bias_type": "legendre",
+  "spatial_bias_type": "none",
   "spatial_bias_degree": 8,
   "spatial_bias_use_unit_sphere": true,
   "spatial_bias_scale": 1.0,

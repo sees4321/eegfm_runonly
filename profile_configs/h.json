@@ -13,7 +13,7 @@
   "attn_dropout": 0.0,
   "rope_theta": 10000.0,
   "rotary_pct": 1.0,
-  "encoder_arch": "divided",
+  "encoder_arch": "hybrid",
   "full_attn_every": 4,
   "full_attn_use_spatial_bias": false,
   "spatial_bias_type": "legendre",
