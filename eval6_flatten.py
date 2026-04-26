@@ -146,6 +146,8 @@ class FTResult:
     lora_dropout: float
     lora_include_spatial_qk: bool
     lora_wrapped_linears: int
+    head_state_dict: Optional[Dict[str, torch.Tensor]] = None
+    encoder_state_dict: Optional[Dict[str, torch.Tensor]] = None
 
 
 class NpySplitDataset(Dataset):
@@ -289,12 +291,12 @@ class FeatureNormalizer(nn.Module):
 
 
 class EEGClassifier(nn.Module):
-    def __init__(self, feature_model: EncoderFeaturizer, n_classes: int, norm_stats: FeatureNormStats):
+    def __init__(self, feature_model: EncoderFeaturizer, n_classes: int, norm_stats: FeatureNormStatsm, feat_dim2: Optional[int] = None):
         super().__init__()
         self.feature_model = feature_model
         self.feature_norm = FeatureNormalizer(norm_stats)
         # self.head = nn.Linear(int(feature_model.feat_dim), int(n_classes))
-        self.head = EEGHead(int(feature_model.feat_dim), int(n_classes))
+        self.head = EEGHead(512*feat_dim2, int(n_classes))
 
     def forward(self, eeg: torch.Tensor, coord: torch.Tensor) -> torch.Tensor:
         feat = self.feature_model(eeg, coord)
@@ -957,6 +959,107 @@ def normalize_features(
     )
 
 
+def clone_state_dict_to_cpu(state_dict: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+    cloned: Dict[str, torch.Tensor] = {}
+    for key, value in state_dict.items():
+        if torch.is_tensor(value):
+            cloned[key] = value.detach().cpu().clone()
+        else:
+            cloned[key] = copy.deepcopy(value)
+    return cloned
+
+
+def module_state_dict_to_cpu(module: nn.Module) -> Dict[str, torch.Tensor]:
+    return clone_state_dict_to_cpu(module.state_dict())
+
+
+def feature_norm_stats_to_payload(stats: FeatureNormStats) -> Dict[str, object]:
+    payload: Dict[str, object] = {"mode": str(stats.mode)}
+    if stats.mean is not None:
+        payload["mean"] = stats.mean.detach().cpu().clone()
+    if stats.std is not None:
+        payload["std"] = stats.std.detach().cpu().clone()
+    return payload
+
+
+def sanitize_path_component(text: str) -> str:
+    text = str(text).strip()
+    if not text:
+        return "unnamed"
+    chars: List[str] = []
+    for ch in text:
+        if ch.isalnum() or ch in ("-", "_", "."):
+            chars.append(ch)
+        else:
+            chars.append("_")
+    safe = "".join(chars).strip("._")
+    return safe or "unnamed"
+
+
+def resolve_lpft_checkpoint_dir(lpft_ckpt_dir: Optional[str], ckpt_dir: str, task: str) -> Path:
+    ckpt_name = sanitize_path_component(Path(ckpt_dir).name)
+    task_name = sanitize_path_component(task)
+    if lpft_ckpt_dir:
+        return Path(lpft_ckpt_dir).expanduser() / ckpt_name / task_name
+    return Path(ckpt_dir).expanduser() / "eval_lpft_checkpoints" / task_name
+
+
+def save_lpft_stage_checkpoints(
+    output_dir: Path,
+    *,
+    stage: str,
+    ckpt_name: str,
+    ckpt_path: str,
+    task: str,
+    task_root: str,
+    label_values: Tuple[int, ...],
+    n_classes: int,
+    head_state_dict: Dict[str, torch.Tensor],
+    encoder_state_dict: Dict[str, torch.Tensor],
+    norm_stats: FeatureNormStats,
+    metadata: Dict[str, object],
+) -> Dict[str, str]:
+    output_dir = Path(output_dir).expanduser()
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    base_payload = {
+        "stage": str(stage),
+        "ckpt_name": str(ckpt_name),
+        "ckpt_path": str(ckpt_path),
+        "task": str(task),
+        "task_root": str(task_root),
+        "label_values": tuple(int(v) for v in label_values),
+        "n_classes": int(n_classes),
+        "feat_norm": feature_norm_stats_to_payload(norm_stats),
+        "metadata": copy.deepcopy(metadata),
+    }
+
+    head_path = output_dir / f"best_{stage}_head.pt"
+    encoder_path = output_dir / f"best_{stage}_encoder.pt"
+
+    torch.save(
+        {
+            **base_payload,
+            "component": "head",
+            "state_dict": clone_state_dict_to_cpu(head_state_dict),
+        },
+        head_path,
+    )
+    torch.save(
+        {
+            **base_payload,
+            "component": "encoder",
+            "state_dict": clone_state_dict_to_cpu(encoder_state_dict),
+        },
+        encoder_path,
+    )
+
+    return {
+        "head": str(head_path),
+        "encoder": str(encoder_path),
+    }
+
+
 # -------------------------
 # Feature extraction
 # -------------------------
@@ -996,9 +1099,12 @@ def extract_features(
     loader = DataLoader(ds, **loader_kwargs)
 
     base_model = unwrap_module(feature_model)
-    feat_dim = int(getattr(base_model, "feat_dim"))
+    feat_dim = int(getattr(base_model, "embed_dim"))
+    for eeg, coord, y in loader:
+        _, C, S = eeg.shape
+        break
     N = len(ds)
-    X = torch.empty((N, feat_dim), dtype=torch.float32)
+    X = torch.empty((N, feat_dim*C*S), dtype=torch.float32)
     y_all = torch.empty((N,), dtype=torch.long)
 
     offset = 0
@@ -1008,7 +1114,7 @@ def extract_features(
         coord = coord.to(device, non_blocking=True)
         feat = feature_model(eeg, coord)
         feat_cpu = feat.detach().float().cpu()
-        X[offset : offset + B] = feat_cpu
+        X[offset : offset + B] = torch.flatten(feat_cpu, start_dim=1)
         y_all[offset : offset + B] = y.cpu()
         offset += B
 
@@ -1020,52 +1126,54 @@ def extract_features(
 # Linear probe training
 # -------------------------
 def train_linear_probe(
-    X_train: torch.Tensor,
-    y_train: torch.Tensor,
-    X_val: torch.Tensor,
-    y_val: torch.Tensor,
-    X_test: torch.Tensor,
-    y_test: torch.Tensor,
+    feature_model: nn.Module,   # 추가
+    train_ds: Dataset,          # 변경
+    val_ds: Dataset,            # 변경
+    test_ds: Dataset,           # 변경
     n_classes: int,
     device: torch.device,
     lr: float,
     epochs: int,
     patience: int,
     batch_size: int,
+    num_workers: int,           # 추가
+    pin_memory: bool,           # 추가
+    coord_scale: float,         # 추가
+    amp: bool,                  # 추가
     weight_decay: float = 0.0,
     class_weight: Optional[str] = None,
     seed: int = 42,
 ) -> LPResult:
     set_seed(seed)
-    head = EEGHead(X_train.shape[1], n_classes).to(device) # nn.Linear(X_train.shape[1], n_classes).to(device)
-    opt = torch.optim.AdamW(head.parameters(), lr=lr, weight_decay=weight_decay)
+# 1. Dummy norm_stats (On-the-fly에서는 전체 데이터 통계(zscore)를 미리 내기 어려우므로 none으로 처리)
+    norm_stats = FeatureNormStats(mode="none")
 
-    if class_weight == "balanced":
-        with torch.no_grad():
-            counts = torch.bincount(y_train.cpu(), minlength=n_classes).float()
-            w = (counts.sum() / counts.clamp_min(1.0))
-            w = (w / w.mean()).to(device)
-        loss_fn = nn.CrossEntropyLoss(weight=w)
-    else:
-        loss_fn = nn.CrossEntropyLoss()
+    # 3. 데이터 로더 생성
+    train_loader = _make_eeg_loader(train_ds, batch_size=batch_size, shuffle=True, seed=seed, num_workers=num_workers, pin_memory=pin_memory, coord_scale=coord_scale)
+    val_loader = _make_eeg_loader(val_ds, batch_size=batch_size, shuffle=False, seed=seed, num_workers=num_workers, pin_memory=pin_memory, coord_scale=coord_scale)
+    test_loader = _make_eeg_loader(test_ds, batch_size=batch_size, shuffle=False, seed=seed, num_workers=num_workers, pin_memory=pin_memory, coord_scale=coord_scale)
 
-    train_ds = TensorDataset(X_train, y_train)
-    val_ds = TensorDataset(X_val, y_val)
-    test_ds = TensorDataset(X_test, y_test)
+    for eeg, coord, y in train_loader:
+        _, C, S = eeg.shape
+        break
+        
+    loss_fn = nn.CrossEntropyLoss() # (Class weight 적용 시 train_ds를 순회하여 bincount 계산 필요)
+    
+    # 2. Classifier 구성 및 Feature Model 프리징 (LP이므로 Head만 학습)
+    model = EEGClassifier(feature_model, n_classes=n_classes, norm_stats=norm_stats, feat_dim2=C*S).to(device)
+    for param in model.feature_model.parameters():
+        param.requires_grad = False
+        
+    opt = torch.optim.AdamW(model.head.parameters(), lr=lr, weight_decay=weight_decay)
 
-    train_gen = torch.Generator()
-    train_gen.manual_seed(seed)
-    train_loader = DataLoader(
-        train_ds,
-        batch_size=batch_size,
-        shuffle=True,
-        generator=train_gen,
-        num_workers=0,
-        pin_memory=True,
-        drop_last=False,
-    )
-    val_loader = DataLoader(val_ds, batch_size=batch_size, shuffle=False, num_workers=0, pin_memory=True, drop_last=False)
-    test_loader = DataLoader(test_ds, batch_size=batch_size, shuffle=False, num_workers=0, pin_memory=True, drop_last=False)
+    # if class_weight == "balanced":
+    #     with torch.no_grad():
+    #         counts = torch.bincount(y_train.cpu(), minlength=n_classes).float()
+    #         w = (counts.sum() / counts.clamp_min(1.0))
+    #         w = (w / w.mean()).to(device)
+    #     loss_fn = nn.CrossEntropyLoss(weight=w)
+    # else:
+    # loss_fn = nn.CrossEntropyLoss()
 
     best_val = -1.0
     best_epoch = -1
@@ -1081,35 +1189,38 @@ def train_linear_probe(
     last_epoch = 0
 
     for ep in range(1, epochs + 1):
-        head.train()
+        model.train()
+        model.feature_model.eval() # Encoder는 항상 eval 모드
+        
         correct_tr = 0
         total_tr = 0
-        for xb, yb in train_loader:
-            xb = xb.to(device, non_blocking=True)
+        
+        # 4. Train Loop (On-the-fly Feature Extraction)
+        for eeg, coord, yb in train_loader:
+            eeg = eeg.to(device, non_blocking=True)
+            coord = coord.to(device, non_blocking=True)
             yb = yb.to(device, non_blocking=True)
+            
             opt.zero_grad(set_to_none=True)
-            logits = head(xb)
+            with torch.amp.autocast(device.type, dtype=torch.bfloat16, enabled=(amp and device.type == "cuda")):
+                logits = model(eeg, coord)
+                loss = loss_fn(logits, yb)
+                
+            loss.backward()
+            opt.step()
+            
             pred = logits.argmax(dim=-1)
             correct_tr += int((pred == yb).sum().item())
             total_tr += int(yb.numel())
-            loss = loss_fn(logits, yb)
-            loss.backward()
-            opt.step()
 
         train_acc = correct_tr / max(1, total_tr)
         train_acc_last = float(train_acc)
         last_epoch = int(ep)
 
-        head.eval()
+        model.eval()
         with torch.no_grad():
-            val_metrics = evaluate_head(head, val_loader, n_classes=n_classes, device=device)
-            test_metrics = evaluate_head(
-                head,
-                test_loader,
-                n_classes=n_classes,
-                device=device,
-                binary_test_metrics=(n_classes == 2),
-            )
+            val_metrics = evaluate_classifier(model, val_loader, n_classes=n_classes, device=device)
+            test_metrics = evaluate_classifier(model, test_loader, n_classes=n_classes, device=device, binary_test_metrics=(n_classes == 2))
 
         if val_metrics.f1w > best_val_f1w + 1e-6:
             best_val = float(val_metrics.acc)
@@ -1642,14 +1753,16 @@ def train_lpft_finetune(
 ) -> FTResult:
     set_seed(seed)
 
-    encoder = EEGEncoder.from_pretrained(ckpt_dir, map_location="cpu")
-    feature_model = EncoderFeaturizer(
-        encoder,
-        pool=pool,
-        amp=amp,
-        apply_rescale=apply_rescale,
-        rescale_kwargs=rescale_kwargs,
-    )
+    # encoder = EEGEncoder.from_pretrained(ckpt_dir, map_location="cpu")
+    # feature_model = EncoderFeaturizer(
+    #     encoder,
+    #     pool=pool,
+    #     amp=amp,
+    #     apply_rescale=apply_rescale,
+    #     rescale_kwargs=rescale_kwargs,
+    # )
+    from transformers import AutoModel
+    feature_model = AutoModel.from_pretrained("brain-bzh/reve-base", trust_remote_code=True)
     model = EEGClassifier(feature_model, n_classes=n_classes, norm_stats=norm_stats)
     model.head.load_state_dict(copy.deepcopy(lp_head_state))
     model.to(device)
@@ -1751,6 +1864,8 @@ def train_lpft_finetune(
     best_val_f1w = -1.0
     best_test_f1w = -1.0
     best_test_kappa = -1.0
+    best_head_state: Optional[Dict[str, torch.Tensor]] = None
+    best_encoder_state: Optional[Dict[str, torch.Tensor]] = None
     train_acc_at_best = 0.0
     train_acc_last = 0.0
     last_epoch = 0
@@ -1796,26 +1911,28 @@ def train_lpft_finetune(
 
         with torch.no_grad():
             val_metrics = evaluate_classifier(model, 
-                                              test_loader, 
+                                              val_loader, 
                                               n_classes=n_classes, 
                                               device=device,
                                               binary_test_metrics=(n_classes == 2))
 
-        if val_metrics.acc > best_val + 1e-6:
+        if val_metrics.f1w > best_val_f1w + 1e-6:
             with torch.no_grad():
                 test_metrics = evaluate_classifier(
                     model,
-                    val_loader,
+                    test_loader,
                     n_classes=n_classes,
                     device=device,
                     binary_test_metrics=(n_classes == 2),
                 )
-            best_val = float(test_metrics.acc)
+            best_val = float(val_metrics.acc)
             best_epoch = int(ep)
-            best_test_acc = float(val_metrics.acc)
-            best_val_f1w = float(test_metrics.f1w)
-            best_test_f1w = float(val_metrics.f1w)
-            best_test_kappa = float(val_metrics.kappa)
+            best_test_acc = float(test_metrics.acc)
+            best_val_f1w = float(val_metrics.f1w)
+            best_test_f1w = float(test_metrics.f1w)
+            best_test_kappa = float(test_metrics.kappa)
+            best_head_state = module_state_dict_to_cpu(base_model.head)
+            best_encoder_state = module_state_dict_to_cpu(base_model.feature_model.encoder)
             train_acc_at_best = float(train_acc_last)
             bad = 0
         else:
@@ -1848,6 +1965,8 @@ def train_lpft_finetune(
         lora_dropout=float(ft_plan["lora_dropout"]),
         lora_include_spatial_qk=bool(ft_plan["lora_include_spatial_qk"]),
         lora_wrapped_linears=int(ft_plan["lora_wrapped_linears"]),
+        head_state_dict=(clone_state_dict_to_cpu(best_head_state) if best_head_state is not None else None),
+        encoder_state_dict=(clone_state_dict_to_cpu(best_encoder_state) if best_encoder_state is not None else None),
     )
 
 
@@ -2016,6 +2135,7 @@ def build_parser(
         ap.add_argument("--wandb_project", type=str, default="EEG_FM")
         ap.add_argument("--wandb_name", type=str, default="")
 
+    ap.add_argument("--lpft_ckpt_dir", type=str, default='/home/conelab/checkpoints', help="Root directory to save best LP/FT head+encoder checkpoints when --lpft is enabled. Defaults to <ckpt>/eval_lpft_checkpoints/<task>.")
     ap.add_argument("--out_csv", type=str, default=None, help="Path to output CSV file with results")
     return ap
 
@@ -2040,7 +2160,6 @@ def select_device(num_gpus: int) -> Tuple[torch.device, List[int]]:
 
 def run_eval(args: argparse.Namespace) -> List[Dict[str, object]]:
     seed = int(getattr(args, "seed", 42))
-    set_seed(seed)
 
     if float(args.ft_head_lr_mult) <= 0.0:
         raise ValueError("--ft_head_lr_mult must be > 0.")
@@ -2134,305 +2253,353 @@ def run_eval(args: argparse.Namespace) -> List[Dict[str, object]]:
     ft_lr_grid = args.ft_lrs if args.ft_lrs and len(args.ft_lrs) > 0 else [args.ft_lr]
 
     csv_rows: List[Dict[str, object]] = []
-    chosen_lp_lr_per_task: Dict[str, float] = {}
-    chosen_ft_lr_per_task: Dict[str, float] = {}
+    
+    for seed_offset in range(5):
+        current_seed = seed + seed_offset
+        set_seed(current_seed)
 
-    if args.apply_rescale and (args.rescale_rms_low is not None or args.rescale_rms_floor is not None):
-        print(
-            "[eval] ignoring deprecated --rescale_rms_low/--rescale_rms_floor: "
-            "current train.py uses quantile-based rescale with --rescale_target_amp/--rescale_quantile/--rescale_amp_floor."
-        )
+        chosen_lp_lr_per_task: Dict[str, float] = {}
+        chosen_ft_lr_per_task: Dict[str, float] = {}
 
-    for ckpt_idx, ckpt_dir in enumerate(ckpt_dirs):
-        ckpt_dir = str(ckpt_dir)
-        ckpt_name = Path(ckpt_dir).name
-        print()
-        print(f"[ckpt] {ckpt_idx + 1}/{len(ckpt_dirs)} name={ckpt_name}")
-        print(f"  path={ckpt_dir}")
+        if args.apply_rescale and (args.rescale_rms_low is not None or args.rescale_rms_floor is not None):
+            print(
+                "[eval] ignoring deprecated --rescale_rms_low/--rescale_rms_floor: "
+                "current train.py uses quantile-based rescale with --rescale_target_amp/--rescale_quantile/--rescale_amp_floor."
+            )
 
-        encoder = EEGEncoder.from_pretrained(ckpt_dir, map_location="cpu")
-        encoder.to(device)
-        encoder.eval()
-
-        rescale_kwargs = dict(
-            target_amp=float(args.rescale_target_amp),
-            quantile=float(args.rescale_quantile),
-            amp_floor=float(args.rescale_amp_floor),
-            gain_max=float(args.rescale_gain_max),
-            clip=float(args.rescale_clip),
-        )
-
-        feature_model: nn.Module = EncoderFeaturizer(
-            encoder,
-            pool=args.pool,
-            amp=args.amp,
-            apply_rescale=args.apply_rescale,
-            rescale_kwargs=rescale_kwargs,
-        )
-        feature_model.to(device)
-        feature_model.eval()
-        if len(device_ids) > 1:
-            feature_model = nn.DataParallel(feature_model, device_ids=device_ids, output_device=device_ids[0])
-            print(f"[ckpt] feature extraction will use DataParallel on GPUs={device_ids}")
-
-        for task, root in task_specs:
+        for ckpt_idx, ckpt_dir in enumerate(ckpt_dirs):
+            ckpt_dir = str(ckpt_dir)
+            ckpt_name = Path(ckpt_dir).name
             print()
-            print(f"[task={task}] loading splits from {root}")
-            train_ds, val_ds, test_ds, n_classes, split_info = load_task_splits(
-                task=task,
-                root=root,
-                seed=seed,
-                missing_val_ratio=args.missing_val_ratio,
-            )
-            print(
-                f"[task={task}] val_source={split_info.val_source} labels={list(split_info.label_values)} "
-                f"n_classes={n_classes}"
+            print(f"[ckpt] {ckpt_idx + 1}/{len(ckpt_dirs)} name={ckpt_name}")
+            print(f"  path={ckpt_dir}")
+
+            encoder = EEGEncoder.from_pretrained(ckpt_dir, map_location="cpu")
+            encoder.to(device)
+            encoder.eval()
+
+            rescale_kwargs = dict(
+                target_amp=float(args.rescale_target_amp),
+                quantile=float(args.rescale_quantile),
+                amp_floor=float(args.rescale_amp_floor),
+                gain_max=float(args.rescale_gain_max),
+                clip=float(args.rescale_clip),
             )
 
-            print(f"[task={task}] extracting features: train={len(train_ds)} val={len(val_ds)} test={len(test_ds)}")
-            Xtr_raw, ytr = extract_features(
-                feature_model=feature_model,
-                ds=train_ds,
-                device=device,
-                feat_batch_size=args.feat_batch_size,
-                num_workers=args.num_workers,
-                pin_memory=args.pin_memory,
-                coord_scale=args.coord_scale,
+            feature_model: nn.Module = EncoderFeaturizer(
+                encoder,
+                pool=args.pool,
+                amp=args.amp,
+                apply_rescale=args.apply_rescale,
+                rescale_kwargs=rescale_kwargs,
             )
-            Xva_raw, yva = extract_features(
-                feature_model=feature_model,
-                ds=val_ds,
-                device=device,
-                feat_batch_size=args.feat_batch_size,
-                num_workers=args.num_workers,
-                pin_memory=args.pin_memory,
-                coord_scale=args.coord_scale,
-            )
-            Xte_raw, yte = extract_features(
-                feature_model=feature_model,
-                ds=test_ds,
-                device=device,
-                feat_batch_size=args.feat_batch_size,
-                num_workers=args.num_workers,
-                pin_memory=args.pin_memory,
-                coord_scale=args.coord_scale,
-            )
+            
+            from transformers import AutoModel
+            feature_model = AutoModel.from_pretrained("brain-bzh/reve-base", trust_remote_code=True)
+            feature_model.to(device)
+            feature_model.eval()
+            if len(device_ids) > 1:
+                feature_model = nn.DataParallel(feature_model, device_ids=device_ids, output_device=device_ids[0])
+                print(f"[ckpt] feature extraction will use DataParallel on GPUs={device_ids}")
 
-            norm_stats = compute_feature_norm_stats(Xtr_raw, mode=args.feat_norm)
-            Xtr, Xva, Xte = normalize_features(Xtr_raw, Xva_raw, Xte_raw, stats=norm_stats)
-            with torch.no_grad():
-                counts = torch.bincount(ytr.cpu(), minlength=n_classes).float()
-                maj = float((counts.max() / counts.sum().clamp_min(1.0)).item())
-                feat_std_mean = float(Xtr.std(dim=0).mean().item())
-                feat_abs_mean = float(Xtr.abs().mean().item())
-            print(
-                f"[task={task}] pool={args.pool} feat_norm={args.feat_norm} |X|mean={feat_abs_mean:.4f} "
-                f"std_dim_mean={feat_std_mean:.4f} maj={maj:.3f} counts={counts.tolist()}"
-            )
-
-            if args.tune_lr_on == "first_ckpt" and task in chosen_lp_lr_per_task:
-                use_lp_lrs = [chosen_lp_lr_per_task[task]]
-                print(f"[task={task}] [LP] using pre-chosen lr={use_lp_lrs[0]:.2e}")
-            else:
-                use_lp_lrs = lp_lr_grid
-
-            best_lp: Optional[LPResult] = None
-            for lp_lr in use_lp_lrs:
-                r = train_linear_probe(
-                    X_train=Xtr,
-                    y_train=ytr,
-                    X_val=Xva,
-                    y_val=yva,
-                    X_test=Xte,
-                    y_test=yte,
-                    n_classes=n_classes,
-                    device=device,
-                    lr=float(lp_lr),
-                    epochs=int(args.epochs),
-                    patience=int(args.patience),
-                    batch_size=int(args.lp_batch_size),
-                    weight_decay=0.0,
-                    class_weight=None if args.class_weight == "none" else "balanced",
-                    seed=seed,
+            for task, root in task_specs:
+                print()
+                print(f"[task={task}] loading splits from {root}")
+                train_ds, val_ds, test_ds, n_classes, split_info = load_task_splits(
+                    task=task,
+                    root=root,
+                    seed=current_seed,
+                    missing_val_ratio=args.missing_val_ratio,
                 )
                 print(
-                    f"[task={task}] [LP] lr={lp_lr:.2e} best_val={r.best_val_acc:.4f} "
-                    f"test_acc={r.test_acc_at_best:.4f} test_f1w={r.test_f1w_at_best:.4f} test_kappa={r.test_kappa_at_best:.4f} "
-                    f"best_ep={r.best_epoch} train_last={r.train_acc_last:.4f} train@best={r.train_acc_at_best:.4f} stop_ep={r.last_epoch}"
+                    f"[task={task}] val_source={split_info.val_source} labels={list(split_info.label_values)} "
+                    f"n_classes={n_classes}"
                 )
-                if (best_lp is None) or (r.test_acc_at_best > best_lp.test_acc_at_best + 1e-6):
-                    best_lp = r
 
-            assert best_lp is not None
-            if args.tune_lr_on == "first_ckpt" and ckpt_idx == 0:
-                chosen_lp_lr_per_task[task] = float(best_lp.lr)
-                print(f"[task={task}] [LP] chosen lr for reuse across later checkpoints = {best_lp.lr:.2e}")
-
-            best_ft: Optional[FTResult] = None
-
-            if args.lpft:
-                if best_lp.state_dict is None:
-                    raise RuntimeError("LP stage did not return a head state_dict required for LPFT.")
-
-                if args.tune_lr_on == "first_ckpt" and task in chosen_ft_lr_per_task:
-                    use_ft_lrs = [chosen_ft_lr_per_task[task]]
-                    print(f"[task={task}] [FT] using pre-chosen backbone_lr={use_ft_lrs[0]:.2e}")
+                if args.tune_lr_on == "first_ckpt" and task in chosen_lp_lr_per_task:
+                    use_lp_lrs = [chosen_lp_lr_per_task[task]]
+                    print(f"[task={task}] [LP] using pre-chosen lr={use_lp_lrs[0]:.2e}")
                 else:
-                    use_ft_lrs = ft_lr_grid
+                    use_lp_lrs = lp_lr_grid
 
-                for ft_lr in use_ft_lrs:
-                    ft_result = train_lpft_finetune(
-                        ckpt_dir=ckpt_dir,
-                        train_ds=train_ds,
-                        val_ds=val_ds,
-                        test_ds=test_ds,
-                        y_train=ytr,
+                best_lp: Optional[LPResult] = None
+                for lp_lr in use_lp_lrs:
+                    r = train_linear_probe(
+                        feature_model=feature_model,  # 추가
+                        train_ds=train_ds,            # 변경
+                        val_ds=val_ds,                # 변경
+                        test_ds=test_ds,              # 변경
                         n_classes=n_classes,
-                        norm_stats=norm_stats,
-                        lp_head_state=best_lp.state_dict,
                         device=device,
-                        device_ids=device_ids,
-                        coord_scale=args.coord_scale,
-                        pool=args.pool,
-                        amp=args.amp,
-                        apply_rescale=args.apply_rescale,
-                        rescale_kwargs=rescale_kwargs,
-                        backbone_lr=float(ft_lr),
-                        head_lr_mult=float(args.ft_head_lr_mult),
-                        train_scope=str(args.ft_train_scope),
-                        unfreeze_last_k=int(args.ft_unfreeze_last_k),
-                        layer_decay=float(args.ft_layer_decay),
-                        l2sp_weight=float(args.ft_l2sp),
-                        use_lora=bool(args.ft_lora),
-                        lora_rank=int(args.ft_lora_rank),
-                        lora_alpha=float(args.ft_lora_alpha),
-                        lora_dropout=float(args.ft_lora_dropout),
-                        lora_include_spatial_qk=bool(args.ft_lora_include_spatial_qk),
-                        epochs=ft_epochs,
-                        patience=5 if task == 'TUAB' else ft_patience,
-                        batch_size=int(args.ft_batch_size),
-                        num_workers=int(args.num_workers),
-                        pin_memory=bool(args.pin_memory),
-                        weight_decay=float(args.ft_weight_decay),
+                        lr=float(lp_lr),
+                        epochs=int(args.epochs),
+                        patience=int(args.patience),
+                        batch_size=int(args.lp_batch_size),
+                        num_workers=args.num_workers, # 추가
+                        pin_memory=args.pin_memory,   # 추가
+                        coord_scale=args.coord_scale, # 추가
+                        amp=args.amp,                 # 추가
+                        weight_decay=0.0,
                         class_weight=None if args.class_weight == "none" else "balanced",
-                        warmup_ratio=float(args.ft_warmup_ratio),
-                        min_lr_ratio=float(args.ft_min_lr_ratio),
-                        grad_clip=float(args.ft_grad_clip),
-                        seed=seed,
+                        seed=current_seed,
                     )
                     print(
-                        f"[task={task}] [FT] mode={'lora' if ft_result.use_lora else 'direct'} scope={ft_result.train_scope} unfreeze_last_k={ft_result.unfreeze_last_k} "
-                        f"blocks={list(ft_result.trainable_block_indices)} trainable={ft_result.encoder_trainable_params/1e6:.2f}M/"
-                        f"{ft_result.encoder_total_params/1e6:.2f}M backbone_lr={ft_lr:.2e} head_lr={ft_result.head_lr:.2e} "
-                        f"layer_decay={ft_result.layer_decay:.3f} l2sp={ft_result.l2sp_weight:.2e} "
-                        f"lora_rank={ft_result.lora_rank} lora_alpha={ft_result.lora_alpha:.1f} "
-                        f"lora_dropout={ft_result.lora_dropout:.3f} lora_spatial_qk={ft_result.lora_include_spatial_qk} "
-                        f"wrapped={ft_result.lora_wrapped_linears} "
-                        f"best_val={ft_result.best_val_acc:.4f} test_acc={ft_result.test_acc_at_best:.4f} "
-                        f"test_f1w={ft_result.test_f1w_at_best:.4f} test_kappa={ft_result.test_kappa_at_best:.4f} "
-                        f"best_ep={ft_result.best_epoch} train_last={ft_result.train_acc_last:.4f} "
-                        f"train@best={ft_result.train_acc_at_best:.4f} stop_ep={ft_result.last_epoch}"
+                        f"[task={task}] [LP] lr={lp_lr:.2e} best_val={r.best_val_acc:.4f} "
+                        f"test_acc={r.test_acc_at_best:.4f} test_f1w={r.test_f1w_at_best:.4f} test_kappa={r.test_kappa_at_best:.4f} "
+                        f"best_ep={r.best_epoch} train_last={r.train_acc_last:.4f} train@best={r.train_acc_at_best:.4f} stop_ep={r.last_epoch}"
                     )
-                    if (best_ft is None) or (ft_result.test_acc_at_best > best_ft.test_acc_at_best + 1e-6):
-                        best_ft = ft_result
+                    if (best_lp is None) or (r.test_acc_at_best > best_lp.test_acc_at_best + 1e-6):
+                        best_lp = r
 
-                assert best_ft is not None
+                assert best_lp is not None
                 if args.tune_lr_on == "first_ckpt" and ckpt_idx == 0:
-                    chosen_ft_lr_per_task[task] = float(best_ft.backbone_lr)
-                    print(f"[task={task}] [FT] chosen backbone_lr for reuse across later checkpoints = {best_ft.backbone_lr:.2e}")
+                    chosen_lp_lr_per_task[task] = float(best_lp.lr)
+                    print(f"[task={task}] [LP] chosen lr for reuse across later checkpoints = {best_lp.lr:.2e}")
 
-            shared_row = dict(
-                ckpt=ckpt_name,
-                ckpt_path=ckpt_dir,
-                task=task,
-                task_root=root,
-                val_source=split_info.val_source,
-                label_values=";".join(str(v) for v in split_info.label_values),
-                n_classes=n_classes,
-                lp_lr=float(best_lp.lr),
-                ft_lr=(float(best_ft.backbone_lr) if best_ft is not None else None),
-                ft_head_lr=(float(best_ft.head_lr) if best_ft is not None else None),
-                lp_best_epoch=int(best_lp.best_epoch),
-                lp_stop_epoch=int(best_lp.last_epoch),
-                lp_train_acc_last=float(best_lp.train_acc_last),
-                lp_train_acc_at_best=float(best_lp.train_acc_at_best),
-                lp_val_acc=float(best_lp.best_val_acc),
-                lp_val_f1w=float(best_lp.best_val_f1w),
-                lp_test_acc=float(best_lp.test_acc_at_best),
-                lp_test_f1w=float(best_lp.test_f1w_at_best),
-                lp_test_kappa=float(best_lp.test_kappa_at_best),
-                ft_best_epoch=(int(best_ft.best_epoch) if best_ft is not None else None),
-                ft_stop_epoch=(int(best_ft.last_epoch) if best_ft is not None else None),
-                ft_train_scope=(str(best_ft.train_scope) if best_ft is not None else None),
-                ft_unfreeze_last_k=(int(best_ft.unfreeze_last_k) if best_ft is not None else None),
-                ft_trainable_blocks=(";".join(str(v) for v in best_ft.trainable_block_indices) if best_ft is not None else None),
-                ft_encoder_trainable_params=(int(best_ft.encoder_trainable_params) if best_ft is not None else None),
-                ft_encoder_total_params=(int(best_ft.encoder_total_params) if best_ft is not None else None),
-                ft_layer_decay=(float(best_ft.layer_decay) if best_ft is not None else None),
-                ft_l2sp=(float(best_ft.l2sp_weight) if best_ft is not None else None),
-                ft_use_lora=(bool(best_ft.use_lora) if best_ft is not None else None),
-                ft_lora_rank=(int(best_ft.lora_rank) if best_ft is not None else None),
-                ft_lora_alpha=(float(best_ft.lora_alpha) if best_ft is not None else None),
-                ft_lora_dropout=(float(best_ft.lora_dropout) if best_ft is not None else None),
-                ft_lora_include_spatial_qk=(bool(best_ft.lora_include_spatial_qk) if best_ft is not None else None),
-                ft_lora_wrapped_linears=(int(best_ft.lora_wrapped_linears) if best_ft is not None else None),
-                ft_train_acc_last=(float(best_ft.train_acc_last) if best_ft is not None else None),
-                ft_train_acc_at_best=(float(best_ft.train_acc_at_best) if best_ft is not None else None),
-                ft_val_acc=(float(best_ft.best_val_acc) if best_ft is not None else None),
-                ft_val_f1w=(float(best_ft.best_val_f1w) if best_ft is not None else None),
-                ft_test_acc=(float(best_ft.test_acc_at_best) if best_ft is not None else None),
-                ft_test_f1w=(float(best_ft.test_f1w_at_best) if best_ft is not None else None),
-                ft_test_kappa=(float(best_ft.test_kappa_at_best) if best_ft is not None else None),
-            )
+                best_ft: Optional[FTResult] = None
+                lp_ckpt_paths: Optional[Dict[str, str]] = None
+                ft_ckpt_paths: Optional[Dict[str, str]] = None
 
-            lp_row = dict(
-                shared_row,
-                train_mode="lp",
-                lr=float(best_lp.lr),
-                best_epoch=int(best_lp.best_epoch),
-                stop_epoch=int(best_lp.last_epoch),
-                train_acc_last=float(best_lp.train_acc_last),
-                train_acc_at_best=float(best_lp.train_acc_at_best),
-                val_acc=float(best_lp.best_val_acc),
-                val_f1w=float(best_lp.best_val_f1w),
-                test_acc=float(best_lp.test_acc_at_best),
-                test_f1w=float(best_lp.test_f1w_at_best),
-                test_kappa=float(best_lp.test_kappa_at_best),
-            )
-            csv_rows.append(lp_row)
-            print(
-                f"[task={task}] BEST[LP]: val_acc={best_lp.best_val_acc:.4f} val_f1w={best_lp.best_val_f1w:.4f} "
-                f"test_acc={best_lp.test_acc_at_best:.4f} test_f1w={best_lp.test_f1w_at_best:.4f} test_kappa={best_lp.test_kappa_at_best:.4f} "
-                f"lr={best_lp.lr:.2e} train_last={best_lp.train_acc_last:.4f} train@best={best_lp.train_acc_at_best:.4f} stop_ep={best_lp.last_epoch}"
-            )
+                if args.lpft:
+                    if best_lp.state_dict is None:
+                        raise RuntimeError("LP stage did not return a head state_dict required for LPFT.")
 
-            if best_ft is not None:
-                lpft_row = dict(
+                    if args.tune_lr_on == "first_ckpt" and task in chosen_ft_lr_per_task:
+                        use_ft_lrs = [chosen_ft_lr_per_task[task]]
+                        print(f"[task={task}] [FT] using pre-chosen backbone_lr={use_ft_lrs[0]:.2e}")
+                    else:
+                        use_ft_lrs = ft_lr_grid
+
+                    for ft_lr in use_ft_lrs:
+                        ft_result = train_lpft_finetune(
+                            ckpt_dir=ckpt_dir,
+                            train_ds=train_ds,
+                            val_ds=val_ds,
+                            test_ds=test_ds,
+                            y_train=ytr,
+                            n_classes=n_classes,
+                            norm_stats=norm_stats,
+                            lp_head_state=best_lp.state_dict,
+                            device=device,
+                            device_ids=device_ids,
+                            coord_scale=args.coord_scale,
+                            pool=args.pool,
+                            amp=args.amp,
+                            apply_rescale=args.apply_rescale,
+                            rescale_kwargs=rescale_kwargs,
+                            backbone_lr=float(ft_lr),
+                            head_lr_mult=float(args.ft_head_lr_mult),
+                            train_scope=str(args.ft_train_scope),
+                            unfreeze_last_k=int(args.ft_unfreeze_last_k),
+                            layer_decay=float(args.ft_layer_decay),
+                            l2sp_weight=float(args.ft_l2sp),
+                            use_lora=bool(args.ft_lora),
+                            lora_rank=int(args.ft_lora_rank),
+                            lora_alpha=float(args.ft_lora_alpha),
+                            lora_dropout=float(args.ft_lora_dropout),
+                            lora_include_spatial_qk=bool(args.ft_lora_include_spatial_qk),
+                            epochs=ft_epochs,
+                            patience=5 if task == 'TUAB' else ft_patience,
+                            batch_size=int(args.ft_batch_size),
+                            num_workers=int(args.num_workers),
+                            pin_memory=bool(args.pin_memory),
+                            weight_decay=float(args.ft_weight_decay),
+                            class_weight=None if args.class_weight == "none" else "balanced",
+                            warmup_ratio=float(args.ft_warmup_ratio),
+                            min_lr_ratio=float(args.ft_min_lr_ratio),
+                            grad_clip=float(args.ft_grad_clip),
+                            seed=current_seed,
+                        )
+                        print(
+                            f"[task={task}] [FT] mode={'lora' if ft_result.use_lora else 'direct'} scope={ft_result.train_scope} unfreeze_last_k={ft_result.unfreeze_last_k} "
+                            f"blocks={list(ft_result.trainable_block_indices)} trainable={ft_result.encoder_trainable_params/1e6:.2f}M/"
+                            f"{ft_result.encoder_total_params/1e6:.2f}M backbone_lr={ft_lr:.2e} head_lr={ft_result.head_lr:.2e} "
+                            f"layer_decay={ft_result.layer_decay:.3f} l2sp={ft_result.l2sp_weight:.2e} "
+                            f"lora_rank={ft_result.lora_rank} lora_alpha={ft_result.lora_alpha:.1f} "
+                            f"lora_dropout={ft_result.lora_dropout:.3f} lora_spatial_qk={ft_result.lora_include_spatial_qk} "
+                            f"wrapped={ft_result.lora_wrapped_linears} "
+                            f"best_val={ft_result.best_val_acc:.4f} test_acc={ft_result.test_acc_at_best:.4f} "
+                            f"test_f1w={ft_result.test_f1w_at_best:.4f} test_kappa={ft_result.test_kappa_at_best:.4f} "
+                            f"best_ep={ft_result.best_epoch} train_last={ft_result.train_acc_last:.4f} "
+                            f"train@best={ft_result.train_acc_at_best:.4f} stop_ep={ft_result.last_epoch}"
+                        )
+                        if (best_ft is None) or (ft_result.test_acc_at_best > best_ft.test_acc_at_best + 1e-6):
+                            best_ft = ft_result
+
+                    assert best_ft is not None
+                    if args.tune_lr_on == "first_ckpt" and ckpt_idx == 0:
+                        chosen_ft_lr_per_task[task] = float(best_ft.backbone_lr)
+                        print(f"[task={task}] [FT] chosen backbone_lr for reuse across later checkpoints = {best_ft.backbone_lr:.2e}")
+
+                    # lpft_ckpt_dir = resolve_lpft_checkpoint_dir(args.lpft_ckpt_dir, ckpt_dir, task)
+                    # lp_encoder_state = module_state_dict_to_cpu(unwrap_module(feature_model).encoder)
+                    # lp_ckpt_paths = save_lpft_stage_checkpoints(
+                    #     lpft_ckpt_dir,
+                    #     stage="lp",
+                    #     ckpt_name=ckpt_name,
+                    #     ckpt_path=ckpt_dir,
+                    #     task=task,
+                    #     task_root=root,
+                    #     label_values=split_info.label_values,
+                    #     n_classes=n_classes,
+                    #     head_state_dict=best_lp.state_dict,
+                    #     encoder_state_dict=lp_encoder_state,
+                    #     norm_stats=norm_stats,
+                    #     metadata={
+                    #         "lr": float(best_lp.lr),
+                    #         "best_epoch": int(best_lp.best_epoch),
+                    #         "stop_epoch": int(best_lp.last_epoch),
+                    #         "best_val_acc": float(best_lp.best_val_acc),
+                    #         "best_val_f1w": float(best_lp.best_val_f1w),
+                    #         "test_acc_at_best": float(best_lp.test_acc_at_best),
+                    #         "test_f1w_at_best": float(best_lp.test_f1w_at_best),
+                    #         "test_kappa_at_best": float(best_lp.test_kappa_at_best),
+                    #         "train_acc_at_best": float(best_lp.train_acc_at_best),
+                    #         "train_acc_last": float(best_lp.train_acc_last),
+                    #     },
+                    # )
+                    # if best_ft.head_state_dict is None or best_ft.encoder_state_dict is None:
+                    #     raise RuntimeError("LPFT stage did not return best head/encoder states required for checkpoint saving.")
+                    # ft_ckpt_paths = save_lpft_stage_checkpoints(
+                    #     lpft_ckpt_dir,
+                    #     stage="ft",
+                    #     ckpt_name=ckpt_name,
+                    #     ckpt_path=ckpt_dir,
+                    #     task=task,
+                    #     task_root=root,
+                    #     label_values=split_info.label_values,
+                    #     n_classes=n_classes,
+                    #     head_state_dict=best_ft.head_state_dict,
+                    #     encoder_state_dict=best_ft.encoder_state_dict,
+                    #     norm_stats=norm_stats,
+                    #     metadata={
+                    #         "backbone_lr": float(best_ft.backbone_lr),
+                    #         "head_lr": float(best_ft.head_lr),
+                    #         "best_epoch": int(best_ft.best_epoch),
+                    #         "stop_epoch": int(best_ft.last_epoch),
+                    #         "best_val_acc": float(best_ft.best_val_acc),
+                    #         "best_val_f1w": float(best_ft.best_val_f1w),
+                    #         "test_acc_at_best": float(best_ft.test_acc_at_best),
+                    #         "test_f1w_at_best": float(best_ft.test_f1w_at_best),
+                    #         "test_kappa_at_best": float(best_ft.test_kappa_at_best),
+                    #         "train_acc_at_best": float(best_ft.train_acc_at_best),
+                    #         "train_acc_last": float(best_ft.train_acc_last),
+                    #         "train_scope": str(best_ft.train_scope),
+                    #         "unfreeze_last_k": int(best_ft.unfreeze_last_k),
+                    #         "trainable_block_indices": tuple(int(v) for v in best_ft.trainable_block_indices),
+                    #         "encoder_trainable_params": int(best_ft.encoder_trainable_params),
+                    #         "encoder_total_params": int(best_ft.encoder_total_params),
+                    #         "layer_decay": float(best_ft.layer_decay),
+                    #         "l2sp_weight": float(best_ft.l2sp_weight),
+                    #         "use_lora": bool(best_ft.use_lora),
+                    #         "lora_rank": int(best_ft.lora_rank),
+                    #         "lora_alpha": float(best_ft.lora_alpha),
+                    #         "lora_dropout": float(best_ft.lora_dropout),
+                    #         "lora_include_spatial_qk": bool(best_ft.lora_include_spatial_qk),
+                    #         "lora_wrapped_linears": int(best_ft.lora_wrapped_linears),
+                    #     },
+                    # )
+                    # print(
+                    #     f"[task={task}] saved LP checkpoints: head={lp_ckpt_paths['head']} encoder={lp_ckpt_paths['encoder']}\n"
+                    #     f"[task={task}] saved FT checkpoints: head={ft_ckpt_paths['head']} encoder={ft_ckpt_paths['encoder']}"
+                    # )
+
+                shared_row = dict(
+                    ckpt=ckpt_name,
+                    ckpt_path=ckpt_dir,
+                    task=task,
+                    task_root=root,
+                    val_source=split_info.val_source,
+                    label_values=";".join(str(v) for v in split_info.label_values),
+                    n_classes=n_classes,
+                    lp_lr=float(best_lp.lr),
+                    ft_lr=(float(best_ft.backbone_lr) if best_ft is not None else None),
+                    ft_head_lr=(float(best_ft.head_lr) if best_ft is not None else None),
+                    lp_best_epoch=int(best_lp.best_epoch),
+                    lp_stop_epoch=int(best_lp.last_epoch),
+                    lp_train_acc_last=float(best_lp.train_acc_last),
+                    lp_train_acc_at_best=float(best_lp.train_acc_at_best),
+                    lp_val_acc=float(best_lp.best_val_acc),
+                    lp_val_f1w=float(best_lp.best_val_f1w),
+                    lp_test_acc=float(best_lp.test_acc_at_best),
+                    lp_test_f1w=float(best_lp.test_f1w_at_best),
+                    lp_test_kappa=float(best_lp.test_kappa_at_best),
+                    ft_best_epoch=(int(best_ft.best_epoch) if best_ft is not None else None),
+                    ft_stop_epoch=(int(best_ft.last_epoch) if best_ft is not None else None),
+                    ft_train_scope=(str(best_ft.train_scope) if best_ft is not None else None),
+                    ft_unfreeze_last_k=(int(best_ft.unfreeze_last_k) if best_ft is not None else None),
+                    ft_trainable_blocks=(";".join(str(v) for v in best_ft.trainable_block_indices) if best_ft is not None else None),
+                    ft_encoder_trainable_params=(int(best_ft.encoder_trainable_params) if best_ft is not None else None),
+                    ft_encoder_total_params=(int(best_ft.encoder_total_params) if best_ft is not None else None),
+                    ft_layer_decay=(float(best_ft.layer_decay) if best_ft is not None else None),
+                    ft_l2sp=(float(best_ft.l2sp_weight) if best_ft is not None else None),
+                    ft_use_lora=(bool(best_ft.use_lora) if best_ft is not None else None),
+                    ft_lora_rank=(int(best_ft.lora_rank) if best_ft is not None else None),
+                    ft_lora_alpha=(float(best_ft.lora_alpha) if best_ft is not None else None),
+                    ft_lora_dropout=(float(best_ft.lora_dropout) if best_ft is not None else None),
+                    ft_lora_include_spatial_qk=(bool(best_ft.lora_include_spatial_qk) if best_ft is not None else None),
+                    ft_lora_wrapped_linears=(int(best_ft.lora_wrapped_linears) if best_ft is not None else None),
+                    ft_train_acc_last=(float(best_ft.train_acc_last) if best_ft is not None else None),
+                    ft_train_acc_at_best=(float(best_ft.train_acc_at_best) if best_ft is not None else None),
+                    ft_val_acc=(float(best_ft.best_val_acc) if best_ft is not None else None),
+                    ft_val_f1w=(float(best_ft.best_val_f1w) if best_ft is not None else None),
+                    ft_test_acc=(float(best_ft.test_acc_at_best) if best_ft is not None else None),
+                    ft_test_f1w=(float(best_ft.test_f1w_at_best) if best_ft is not None else None),
+                    ft_test_kappa=(float(best_ft.test_kappa_at_best) if best_ft is not None else None),
+                    lp_head_ckpt_path=(lp_ckpt_paths["head"] if lp_ckpt_paths is not None else None),
+                    lp_encoder_ckpt_path=(lp_ckpt_paths["encoder"] if lp_ckpt_paths is not None else None),
+                    ft_head_ckpt_path=(ft_ckpt_paths["head"] if ft_ckpt_paths is not None else None),
+                    ft_encoder_ckpt_path=(ft_ckpt_paths["encoder"] if ft_ckpt_paths is not None else None),
+                )
+
+                lp_row = dict(
                     shared_row,
-                    train_mode="lpft",
-                    lr=float(best_ft.backbone_lr),
-                    best_epoch=int(best_ft.best_epoch),
-                    stop_epoch=int(best_ft.last_epoch),
-                    train_acc_last=float(best_ft.train_acc_last),
-                    train_acc_at_best=float(best_ft.train_acc_at_best),
-                    val_acc=float(best_ft.best_val_acc),
-                    val_f1w=float(best_ft.best_val_f1w),
-                    test_acc=float(best_ft.test_acc_at_best),
-                    test_f1w=float(best_ft.test_f1w_at_best),
-                    test_kappa=float(best_ft.test_kappa_at_best),
+                    train_mode="lp",
+                    lr=float(best_lp.lr),
+                    best_epoch=int(best_lp.best_epoch),
+                    stop_epoch=int(best_lp.last_epoch),
+                    train_acc_last=float(best_lp.train_acc_last),
+                    train_acc_at_best=float(best_lp.train_acc_at_best),
+                    val_acc=float(best_lp.best_val_acc),
+                    val_f1w=float(best_lp.best_val_f1w),
+                    test_acc=float(best_lp.test_acc_at_best),
+                    test_f1w=float(best_lp.test_f1w_at_best),
+                    test_kappa=float(best_lp.test_kappa_at_best),
                 )
-                csv_rows.append(lpft_row)
+                csv_rows.append(lp_row)
                 print(
-                    f"[task={task}] BEST[LPFT]: val_acc={best_ft.best_val_acc:.4f} val_f1w={best_ft.best_val_f1w:.4f} "
-                    f"test_acc={best_ft.test_acc_at_best:.4f} test_f1w={best_ft.test_f1w_at_best:.4f} test_kappa={best_ft.test_kappa_at_best:.4f} "
-                    f"mode={'lora' if best_ft.use_lora else 'direct'} scope={best_ft.train_scope} unfreeze_last_k={best_ft.unfreeze_last_k} blocks={list(best_ft.trainable_block_indices)} "
-                    f"trainable={best_ft.encoder_trainable_params/1e6:.2f}M/{best_ft.encoder_total_params/1e6:.2f}M "
-                    f"backbone_lr={best_ft.backbone_lr:.2e} head_lr={best_ft.head_lr:.2e} "
-                    f"layer_decay={best_ft.layer_decay:.3f} l2sp={best_ft.l2sp_weight:.2e} "
-                    f"lora_rank={best_ft.lora_rank} lora_alpha={best_ft.lora_alpha:.1f} lora_dropout={best_ft.lora_dropout:.3f} "
-                    f"lora_spatial_qk={best_ft.lora_include_spatial_qk} wrapped={best_ft.lora_wrapped_linears} "
-                    f"train_last={best_ft.train_acc_last:.4f} train@best={best_ft.train_acc_at_best:.4f} stop_ep={best_ft.last_epoch}"
+                    f"[task={task}] BEST[LP]: val_acc={best_lp.best_val_acc:.4f} val_f1w={best_lp.best_val_f1w:.4f} "
+                    f"test_acc={best_lp.test_acc_at_best:.4f} test_f1w={best_lp.test_f1w_at_best:.4f} test_kappa={best_lp.test_kappa_at_best:.4f} "
+                    f"lr={best_lp.lr:.2e} train_last={best_lp.train_acc_last:.4f} train@best={best_lp.train_acc_at_best:.4f} stop_ep={best_lp.last_epoch}"
                 )
+
+                if best_ft is not None:
+                    lpft_row = dict(
+                        shared_row,
+                        train_mode="lpft",
+                        lr=float(best_ft.backbone_lr),
+                        best_epoch=int(best_ft.best_epoch),
+                        stop_epoch=int(best_ft.last_epoch),
+                        train_acc_last=float(best_ft.train_acc_last),
+                        train_acc_at_best=float(best_ft.train_acc_at_best),
+                        val_acc=float(best_ft.best_val_acc),
+                        val_f1w=float(best_ft.best_val_f1w),
+                        test_acc=float(best_ft.test_acc_at_best),
+                        test_f1w=float(best_ft.test_f1w_at_best),
+                        test_kappa=float(best_ft.test_kappa_at_best),
+                    )
+                    csv_rows.append(lpft_row)
+                    print(
+                        f"[task={task}] BEST[LPFT]: val_acc={best_ft.best_val_acc:.4f} val_f1w={best_ft.best_val_f1w:.4f} "
+                        f"test_acc={best_ft.test_acc_at_best:.4f} test_f1w={best_ft.test_f1w_at_best:.4f} test_kappa={best_ft.test_kappa_at_best:.4f} "
+                        f"mode={'lora' if best_ft.use_lora else 'direct'} scope={best_ft.train_scope} unfreeze_last_k={best_ft.unfreeze_last_k} blocks={list(best_ft.trainable_block_indices)} "
+                        f"trainable={best_ft.encoder_trainable_params/1e6:.2f}M/{best_ft.encoder_total_params/1e6:.2f}M "
+                        f"backbone_lr={best_ft.backbone_lr:.2e} head_lr={best_ft.head_lr:.2e} "
+                        f"layer_decay={best_ft.layer_decay:.3f} l2sp={best_ft.l2sp_weight:.2e} "
+                        f"lora_rank={best_ft.lora_rank} lora_alpha={best_ft.lora_alpha:.1f} lora_dropout={best_ft.lora_dropout:.3f} "
+                        f"lora_spatial_qk={best_ft.lora_include_spatial_qk} wrapped={best_ft.lora_wrapped_linears} "
+                        f"train_last={best_ft.train_acc_last:.4f} train@best={best_ft.train_acc_at_best:.4f} stop_ep={best_ft.last_epoch}"
+                    )
 
     if use_wandb and csv_rows:
         cols = list(csv_rows[0].keys())
